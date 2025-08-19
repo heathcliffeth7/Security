@@ -10,6 +10,8 @@ import io
 import asyncio
 from collections import defaultdict
 import time
+import signal
+import threading
 _PIL_AVAILABLE = False
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -32,15 +34,47 @@ except Exception:  # pragma: no cover
 # Load environment variables from .env file
 dotenv.load_dotenv()
 
+# Debug mode configuration
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+if DEBUG_MODE:
+    print("🐛 DEBUG MODE ENABLED - Sensitive information may be logged!")
+else:
+    print("🔒 PRODUCTION MODE - Debug logging disabled")
+
 # Intent settings
 intents = discord.Intents.default()
 intents.members = True  # Required for member join events
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Global check: disable all commands in DMs (guild-only)
+@bot.check
+async def _block_dm_commands(ctx: commands.Context) -> bool:
+    # Return False for DMs so commands are ignored
+    return ctx.guild is not None
+
 # Security Authorization
-security_authorized_role_id = SECURİTYMANAGERROLEID  # Your security manager role ID
+# Load security role ID from environment variable for better security
+security_authorized_role_id = int(os.getenv("SECURITY_MANAGER_ROLE_ID", "0"))
+if security_authorized_role_id == 0:
+    print("⚠️  WARNING: SECURITY_MANAGER_ROLE_ID environment variable not set!")
+    print("Security commands will only work with manually added IDs via !securityauthorizedadd")
+    print("To set a default security role: export SECURITY_MANAGER_ROLE_ID='your_role_id_here'")
+
 security_authorized_ids = set()
+
+# Security limits and audit
+MAX_SECURITY_AUTHORIZED_USERS = 4  # Maximum number of authorized users/roles
+security_audit_log = []  # Store security actions for audit
+
+# Rate limiting for critical operations
+command_rate_limits = defaultdict(list)  # user_id -> [timestamp, timestamp, ...]
+SECURITY_COMMAND_RATE_LIMIT = 5  # Max 5 security commands per minute
+SECURITY_COMMAND_RATE_WINDOW = 60  # 60 seconds window
+
+# Rate limit message tracking for security commands
+security_rate_limit_messages = defaultdict(float)
+SECURITY_RATE_LIMIT_MESSAGE_COOLDOWN = 30  # Show rate limit message once per 30 seconds
 
 # Captcha verification settings
 captcha_verify_role_id = None  # Role to grant upon successful captcha
@@ -81,6 +115,56 @@ def is_security_authorized(ctx):
         if role.id in security_authorized_ids:
             return True
     return False
+
+def _check_security_command_rate_limit(user_id: int) -> bool:
+    """Check if user is within rate limit for security commands"""
+    current_time = time.time()
+    user_requests = command_rate_limits[user_id]
+    
+    # Remove old requests outside the window
+    user_requests[:] = [req_time for req_time in user_requests if current_time - req_time < SECURITY_COMMAND_RATE_WINDOW]
+    
+    # Check if user has exceeded rate limit
+    if len(user_requests) >= SECURITY_COMMAND_RATE_LIMIT:
+        return False
+    
+    return True
+
+def _add_security_command_rate_limit_request(user_id: int):
+    """Add a request to the security command rate limit tracker"""
+    current_time = time.time()
+    command_rate_limits[user_id].append(current_time)
+
+async def _handle_security_rate_limit(ctx, command_name: str) -> bool:
+    """Handle rate limiting for security commands. Returns True if rate limited."""
+    user_id = ctx.author.id
+    
+    if not _check_security_command_rate_limit(user_id):
+        current_time = time.time()
+        last_rate_limit_message = security_rate_limit_messages[user_id]
+        
+        # Show rate limit message only once per cooldown period
+        if current_time - last_rate_limit_message >= SECURITY_RATE_LIMIT_MESSAGE_COOLDOWN:
+            security_rate_limit_messages[user_id] = current_time
+            await ctx.send(f"⏰ **Rate limit exceeded!** You can only use {SECURITY_COMMAND_RATE_LIMIT} security commands per minute. Please wait and try again.")
+        
+        # Delete the command message to reduce spam
+        try:
+            await ctx.message.delete()
+        except discord.Forbidden:
+            print(f"[SECURITY] Bot lacks permission to delete command message")
+        except discord.NotFound:
+            print(f"[SECURITY] Command message already deleted")
+        except discord.HTTPException as e:
+            print(f"[SECURITY] HTTP error deleting command message: {e}")
+        except Exception as e:
+            print(f"[SECURITY] Unexpected error deleting command message: {e}")
+        
+        return True  # Rate limited
+    
+    # Add to rate limit tracker
+    _add_security_command_rate_limit_request(user_id)
+    return False  # Not rate limited
 
 # Global Security Filter Variables
 no_avatar_filter_enabled = False
@@ -146,15 +230,56 @@ def _compile_with_flags(pattern_text, flags_letters):
         flags_value |= flag_map.get(ch.lower(), 0)
     return _REGEX_ENGINE.compile(pattern_text, flags_value)
 
+# Security: Safe regex search with timeout to prevent ReDoS attacks
+def _safe_regex_search(compiled_pattern, text, timeout_seconds=1):
+    """
+    Safely search regex with timeout to prevent ReDoS (Regular Expression Denial of Service) attacks
+    """
+    if not text:
+        return None
+    
+    # Limit text length to prevent memory issues
+    MAX_TEXT_LENGTH = 10000
+    if len(text) > MAX_TEXT_LENGTH:
+        text = text[:MAX_TEXT_LENGTH]
+    
+    result = [None]
+    exception = [None]
+    
+    def search_worker():
+        try:
+            result[0] = compiled_pattern.search(text)
+        except Exception as e:
+            exception[0] = e
+    
+    # Use threading for timeout (signal doesn't work well with Discord.py)
+    thread = threading.Thread(target=search_worker, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+    
+    if thread.is_alive():
+        # Timeout occurred - potential ReDoS attack
+        print(f"[SECURITY] Regex timeout detected - potential ReDoS attack blocked")
+        return None
+    
+    if exception[0]:
+        print(f"[SECURITY] Regex error: {exception[0]}")
+        return None
+        
+    return result[0]
+
 # Message moderation via regex
 @bot.event
 async def on_message(message: discord.Message):
+    # Ignore bot messages
     if message.author.bot:
-                                return
+        return
+    # If DM, do not process commands or moderation
+    if message.guild is None:
+        return
+    # Let command processor run only in guilds
     if isinstance(bot.command_prefix, str) and message.content.startswith(bot.command_prefix):
         await bot.process_commands(message)
-        return
-    if message.guild is None:
         return
     guild_rules = regex_settings_by_guild.get(message.guild.id)
     if not guild_rules:
@@ -165,7 +290,8 @@ async def on_message(message: discord.Message):
         compiled = rule.get("compiled")
         if not compiled or not channels:
             continue
-        if channel_id in channels and compiled.search(message.content or ""):
+        # Security: Use safe regex search to prevent ReDoS attacks
+        if channel_id in channels and _safe_regex_search(compiled, message.content or ""):
             # Exemptions: users or roles
             exempt_users = rule.get("exempt_users", set())
             exempt_roles = rule.get("exempt_roles", set())
@@ -176,8 +302,14 @@ async def on_message(message: discord.Message):
                 continue
             try:
                 await message.delete()
-            except Exception:
-                pass
+            except discord.Forbidden:
+                print(f"[SECURITY] Bot lacks permission to delete message in {message.channel}")
+            except discord.NotFound:
+                print(f"[SECURITY] Message already deleted in {message.channel}")
+            except discord.HTTPException as e:
+                print(f"[SECURITY] HTTP error deleting message: {e}")
+            except Exception as e:
+                print(f"[SECURITY] Unexpected error deleting message: {e}")
             break
 
 # Button interaction handler - Add this to fix the interaction failed issue
@@ -242,7 +374,10 @@ async def on_interaction(interaction):
             try:
                 # Generate fresh captcha code each time
                 code = _generate_captcha_code()
-                print(f"[captcha] Generated FRESH code: {code} for user {user_id} (attempt #{verify_button_usage[user_id]}), PIL available: {_PIL_AVAILABLE}")
+                # Security: Log hash instead of actual code to prevent bypass
+                import hashlib
+                code_hash = hashlib.sha256(code.encode()).hexdigest()[:8]
+                print(f"[captcha] Generated captcha (hash: {code_hash}) for user {user_id} (attempt #{verify_button_usage[user_id]}), PIL available: {_PIL_AVAILABLE}")
 
                 # Add to rate limit tracker only when captcha is successfully generated
                 _add_captcha_rate_limit_request(user_id)
@@ -282,8 +417,12 @@ async def on_interaction(interaction):
                 active_captcha_sessions.discard(user_id)
                 try:
                     await interaction.followup.send("An error occurred while generating captcha. Please try again.", ephemeral=True)
-                except Exception:
-                    pass
+                except discord.Forbidden:
+                    print(f"[SECURITY] Bot lacks permission to send followup message")
+                except discord.HTTPException as e:
+                    print(f"[SECURITY] HTTP error sending followup message: {e}")
+                except Exception as e:
+                    print(f"[SECURITY] Unexpected error sending followup message: {e}")
             return
             
         # Handle CAPTCHA code entry button  
@@ -296,6 +435,10 @@ async def on_interaction(interaction):
 async def define_regex(ctx, regexsettingsname: str, *, regexcommand: str):
     if not is_security_authorized(ctx):
         await ctx.message.delete()
+        return
+    
+    # Security: Rate limiting
+    if await _handle_security_rate_limit(ctx, "regex"):
         return
     name_key = regexsettingsname.strip().lower()
     # Accept extended syntaxes: /pattern/flags or plain pattern with optional --flags i m s x ...
@@ -585,6 +728,10 @@ async def noavatarfilter_command(ctx, state: str, mode: str = None, duration: in
     if not is_security_authorized(ctx):
         await ctx.message.delete()
         return
+    
+    # Security: Rate limiting
+    if await _handle_security_rate_limit(ctx, "noavatarfilter"):
+        return
     global no_avatar_filter_enabled, no_avatar_action, no_avatar_timeout_duration
     state = state.lower()
     if state == "on":
@@ -613,6 +760,10 @@ async def noavatarfilter_command(ctx, state: str, mode: str = None, duration: in
 async def accountagefilter_command(ctx, state: str, min_age: int = None, mode: str = None, duration: int = None):
     if not is_security_authorized(ctx):
         await ctx.message.delete()
+        return
+    
+    # Security: Rate limiting
+    if await _handle_security_rate_limit(ctx, "accountagefilter"):
         return
     global account_age_filter_enabled, account_age_min_days, account_age_action, account_age_timeout_duration
     state = state.lower()
@@ -648,29 +799,134 @@ async def securityauthorizedadd(ctx, identifier: str):
     if not is_security_authorized(ctx):
         await ctx.message.delete()
         return
+    
+    # Security: Rate limiting
+    if await _handle_security_rate_limit(ctx, "securityauthorizedadd"):
+        return
+    
+    # Security: Check maximum limit
+    if len(security_authorized_ids) >= MAX_SECURITY_AUTHORIZED_USERS:
+        await ctx.send(f"⚠️ Maximum security authorization limit reached ({MAX_SECURITY_AUTHORIZED_USERS}). Remove an existing authorization first.")
+        return
+    
     try:
         id_val = int(identifier.strip("<@&>"))
     except ValueError:
         await ctx.send("Please provide a valid user or role ID.")
         return
+    
+    # Security: Check if ID already exists
+    if id_val in security_authorized_ids:
+        await ctx.send("This ID is already authorized for security commands.")
+        return
+    
+    # Security: Validate that the ID exists in the guild
+    is_valid = False
+    target_type = "Unknown"
+    target_name = "Unknown"
+    
+    # Check if it's a valid user
+    member = ctx.guild.get_member(id_val)
+    if member:
+        is_valid = True
+        target_type = "User"
+        target_name = f"{member.display_name} ({member.name})"
+    else:
+        # Check if it's a valid role
+        role = ctx.guild.get_role(id_val)
+        if role:
+            is_valid = True
+            target_type = "Role"
+            target_name = role.name
+    
+    if not is_valid:
+        await ctx.send("⚠️ Invalid ID: No user or role found with this ID in the current guild.")
+        return
+    
+    # Add to authorized list
     security_authorized_ids.add(id_val)
-    await ctx.send(f"{identifier} is now authorized for security commands.")
+    
+    # Security: Audit logging
+    import datetime
+    audit_entry = {
+        "action": "SECURITY_AUTH_ADD",
+        "executor": f"{ctx.author.name} ({ctx.author.id})",
+        "target": f"{target_name} ({id_val})",
+        "target_type": target_type,
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "guild": f"{ctx.guild.name} ({ctx.guild.id})"
+    }
+    security_audit_log.append(audit_entry)
+    
+    # Keep only last 100 audit entries
+    if len(security_audit_log) > 100:
+        security_audit_log.pop(0)
+    
+    print(f"[SECURITY_AUDIT] {audit_entry['action']}: {audit_entry['executor']} authorized {audit_entry['target']}")
+    
+    await ctx.send(f"✅ {target_type} **{target_name}** is now authorized for security commands.\n📊 Total authorized: {len(security_authorized_ids)}/{MAX_SECURITY_AUTHORIZED_USERS}")
 
 @bot.command(name="securityauthorizedremove")
 async def securityauthorizedremove(ctx, identifier: str):
     if not is_security_authorized(ctx):
         await ctx.message.delete()
         return
+    
+    # Security: Rate limiting
+    if await _handle_security_rate_limit(ctx, "securityauthorizedremove"):
+        return
+    
     try:
         id_val = int(identifier.strip("<@&>"))
     except ValueError:
         await ctx.send("Please provide a valid user or role ID.")
         return
-    if id_val in security_authorized_ids:
-        security_authorized_ids.remove(id_val)
-        await ctx.send(f"{identifier} has been removed from the security authorized list.")
+    
+    if id_val not in security_authorized_ids:
+        await ctx.send("⚠️ The specified ID was not found in the security authorized list.")
+        return
+    
+    # Security: Get target info for audit
+    target_type = "Unknown"
+    target_name = "Unknown"
+    
+    # Check if it's a user
+    member = ctx.guild.get_member(id_val)
+    if member:
+        target_type = "User"
+        target_name = f"{member.display_name} ({member.name})"
     else:
-        await ctx.send("The specified ID was not found in the security authorized list.")
+        # Check if it's a role
+        role = ctx.guild.get_role(id_val)
+        if role:
+            target_type = "Role"
+            target_name = role.name
+        else:
+            # ID not found in guild but exists in authorized list (maybe left guild)
+            target_name = f"ID: {id_val}"
+    
+    # Remove from authorized list
+    security_authorized_ids.remove(id_val)
+    
+    # Security: Audit logging
+    import datetime
+    audit_entry = {
+        "action": "SECURITY_AUTH_REMOVE",
+        "executor": f"{ctx.author.name} ({ctx.author.id})",
+        "target": f"{target_name} ({id_val})",
+        "target_type": target_type,
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "guild": f"{ctx.guild.name} ({ctx.guild.id})"
+    }
+    security_audit_log.append(audit_entry)
+    
+    # Keep only last 100 audit entries
+    if len(security_audit_log) > 100:
+        security_audit_log.pop(0)
+    
+    print(f"[SECURITY_AUDIT] {audit_entry['action']}: {audit_entry['executor']} removed {audit_entry['target']}")
+    
+    await ctx.send(f"✅ {target_type} **{target_name}** has been removed from the security authorized list.\n📊 Total authorized: {len(security_authorized_ids)}/{MAX_SECURITY_AUTHORIZED_USERS}")
 
 @bot.command(name="securitysettings")
 async def securitysettings(ctx):
@@ -694,6 +950,44 @@ async def securitysettings(ctx):
     else:
         ids_str = "No authorized IDs added"
     embed.add_field(name="Security Authorized IDs", value=ids_str, inline=False)
+    embed.add_field(name="Authorization Limit", value=f"{len(security_authorized_ids)}/{MAX_SECURITY_AUTHORIZED_USERS}", inline=True)
+    embed.add_field(name="Audit Log Entries", value=f"{len(security_audit_log)}/100", inline=True)
+    embed.add_field(name="Rate Limiting", value=f"{SECURITY_COMMAND_RATE_LIMIT} commands/{SECURITY_COMMAND_RATE_WINDOW}s", inline=True)
+    await ctx.send(embed=embed)
+
+@bot.command(name="securityaudit")
+async def securityaudit(ctx, limit: int = 10):
+    if not is_security_authorized(ctx):
+        await ctx.message.delete()
+        return
+    
+    if limit < 1 or limit > 50:
+        await ctx.send("Limit must be between 1 and 50.")
+        return
+    
+    if not security_audit_log:
+        await ctx.send("No security audit entries found.")
+        return
+    
+    # Get last N entries
+    recent_entries = security_audit_log[-limit:]
+    
+    embed = discord.Embed(
+        title="🔍 Security Audit Log",
+        description=f"Showing last {len(recent_entries)} entries",
+        color=discord.Color.orange()
+    )
+    
+    for i, entry in enumerate(reversed(recent_entries), 1):
+        action_emoji = "➕" if "ADD" in entry["action"] else "➖"
+        timestamp = entry["timestamp"][:19].replace("T", " ")  # Format: YYYY-MM-DD HH:MM:SS
+        
+        embed.add_field(
+            name=f"{action_emoji} #{i} - {entry['action']}",
+            value=f"**Executor:** {entry['executor']}\n**Target:** {entry['target']}\n**Time:** {timestamp}",
+            inline=False
+        )
+    
     await ctx.send(embed=embed)
 
 @bot.command(name="securityhelp")
@@ -710,37 +1004,39 @@ async def securityhelp(ctx):
         "   - Description: Checks new members for minimum account age. Mode options: `ban`, `kick`, `timeout`.\n"
         "   - Example: `!accountagefilter on 7 timeout 60` → Applies a 60-minute timeout to accounts younger than 7 days.\n\n"
         "3. **!securityauthorizedadd <id>**\n"
-        "   - Description: Authorizes the specified user or role ID for security commands.\n\n"
+        "   - Description: Authorizes the specified user or role ID for security commands (with validation and audit).\n\n"
         "4. **!securityauthorizedremove <id>**\n"
-        "   - Description: Removes the specified user or role ID from the security authorized list.\n\n"
+        "   - Description: Removes the specified user or role ID from the security authorized list (with audit).\n\n"
         "5. **!securitysettings**\n"
         "   - Description: Displays current security settings (filter statuses, actions, timeout durations, etc.).\n\n"
-        "6. **!regex <regexsettingsname> <regex>**\n"
+        "6. **!securityaudit [limit]**\n"
+        "   - Description: Shows security audit log (default: 10 entries, max: 50).\n\n"
+        "7. **!regex <regexsettingsname> <regex>**\n"
         "   - Description: Defines/updates a regex rule with the given name. Supports `/pattern/flags` or `pattern --flags imsx`. If the advanced `regex` engine is installed it is used; otherwise Python's built-in `re` is used.\n\n"
-        "7. **!setregexsettings <regexsettingsname> <channels>**\n"
+        "8. **!setregexsettings <regexsettingsname> <channels>**\n"
         "   - Description: Assigns which channels the regex rule applies to. You can specify multiple channels by ID or #mention.\n"
         "   - Also supported: `!setregexsettings <name> allchannel notchannel <channels_to_exclude>` → apply to all text channels except the ones listed after `notchannel`.\n\n"
-        "8. **!setregexexempt <regexsettingsname> users|roles <targets>**\n"
+        "9. **!setregexexempt <regexsettingsname> users|roles <targets>**\n"
         "   - Description: Sets users or roles exempt from the rule.\n\n"
-        "9. **!regexsettings [regexsettingsname]**\n"
+        "10. **!regexsettings [regexsettingsname]**\n"
         "   - Description: Shows active regex rules and their details (channels and exemptions). Provide a name to see only that rule.\n\n"
-        "10. **!delregexsettings <regexsettingsname>**\n"
+        "11. **!delregexsettings <regexsettingsname>**\n"
         "   - Description: Deletes the specified regex setting from this server.\n\n"
-        "11. **!setverifyrole <role_id|@role>**\n"
+        "12. **!setverifyrole <role_id|@role>**\n"
         "   - Description: Sets the role to be assigned after successful CAPTCHA verification.\n"
         "   - Example: `!setverifyrole @Verified` → Sets the Verified role as the verification reward.\n\n"
-        "12. **!sendverifypanel [#channel|channel_id]**\n"
+        "13. **!sendverifypanel [#channel|channel_id]**\n"
         "   - Description: Sends a verification panel with CAPTCHA button to the specified channel (or current channel).\n"
         "   - Example: `!sendverifypanel #verification` → Sends verification panel to the verification channel.\n\n"
-        "13. **!setverifypaneltext <title|description|image> <text|url>**\n"
+        "14. **!setverifypaneltext <title|description|image> <text|url>**\n"
         "   - Description: Customizes the verification panel title, description text, or image.\n"
         "   - Examples: `!setverifypaneltext title Welcome to Our Server` → Changes panel title.\n"
         "   - `!setverifypaneltext image https://example.com/logo.png` → Adds panel image.\n\n"
-        "14. **!showverifypaneltext**\n"
+        "15. **!showverifypaneltext**\n"
         "   - Description: Shows the current verification panel text settings.\n\n"
-        "15. **!resetverifypaneltext**\n"
+        "16. **!resetverifypaneltext**\n"
         "   - Description: Resets verification panel text to default values.\n\n"
-        "16. **!securityhelp**\n"
+        "17. **!securityhelp**\n"
         "   - Description: Shows this help menu.\n"
     )
     # Split into chunks to respect Discord 2000-char message limit
@@ -1113,7 +1409,8 @@ class CaptchaModal(discord.ui.Modal):
         # Clean up session after successful verification
         if self.user_id:
             active_captcha_sessions.discard(self.user_id)
-            print(f"[captcha] Successfully verified user {self.user_id}")
+            # Security: Don't log sensitive verification details
+            print(f"[captcha] User verification completed successfully (ID: {self.user_id})")
 
 
 class CaptchaVerifyView(discord.ui.View):
@@ -1174,6 +1471,10 @@ async def setverifyrole(ctx, role_identifier: str):
     if not is_security_authorized(ctx):
         await ctx.message.delete()
         return
+    
+    # Security: Rate limiting
+    if await _handle_security_rate_limit(ctx, "setverifyrole"):
+        return
     global captcha_verify_role_id
 
     raw = role_identifier.strip()
@@ -1194,28 +1495,34 @@ async def setverifyrole(ctx, role_identifier: str):
 
 @bot.command(name="setverifypaneltext")
 async def setverifypaneltext(ctx, text_type: str, *, content: str):
-    # Debug: Command triggered
-    print(f"[DEBUG] setverifypaneltext command triggered by {ctx.author} with type: {text_type}")
+    # Security: Only log in debug mode to prevent information disclosure
+    if DEBUG_MODE:
+        print(f"[DEBUG] setverifypaneltext command triggered by {ctx.author} with type: {text_type}")
     
     if not is_security_authorized(ctx):
         await ctx.message.delete()
-        print(f"[DEBUG] User {ctx.author} not authorized")
+        if DEBUG_MODE:
+            print(f"[DEBUG] User {ctx.author} not authorized")
         return
     
-    print(f"[DEBUG] User authorized, processing...")
+    if DEBUG_MODE:
+        print(f"[DEBUG] User authorized, processing...")
     
     guild_id = ctx.guild.id
     text_type = text_type.lower().strip()
     
-    print(f"[DEBUG] Text type: {text_type}, Content length: {len(content)}")
+    if DEBUG_MODE:
+        print(f"[DEBUG] Text type: {text_type}, Content length: {len(content)}")
     
     if text_type not in ["title", "description", "image"]:
         await ctx.send("Please specify either `title`, `description`, or `image`. Examples:\n• `!setverifypaneltext title Welcome to Our Server`\n• `!setverifypaneltext image https://example.com/image.png`")
-        print(f"[DEBUG] Invalid text type: {text_type}")
+        if DEBUG_MODE:
+            print(f"[DEBUG] Invalid text type: {text_type}")
         return
     
     if text_type == "image":
-        print(f"[DEBUG] Processing image URL: {content[:100]}...")
+        if DEBUG_MODE:
+            print(f"[DEBUG] Processing image URL: {content[:100]}...")
         
         # Validate URL format (expanded check for various platforms)
         content_lower = content.lower()
@@ -1225,16 +1532,20 @@ async def setverifypaneltext(ctx, text_type: str, *, content: str):
             "http://", "https://", "blob:", "data:"
         ]
         
-        print(f"[DEBUG] Checking protocols...")
+        if DEBUG_MODE:
+            print(f"[DEBUG] Checking protocols...")
         if not any(content.startswith(protocol) for protocol in valid_protocols):
             await ctx.send("Image must be a valid URL starting with http://, https://, blob:, or data:")
-            print(f"[DEBUG] Invalid protocol in URL: {content[:50]}")
+            if DEBUG_MODE:
+                print(f"[DEBUG] Invalid protocol in URL: {content[:50]}")
             return
         
-        print(f"[DEBUG] Protocol check passed")
+        if DEBUG_MODE:
+            print(f"[DEBUG] Protocol check passed")
         
         # Special handling for different URL types
-        print(f"[DEBUG] Starting platform validation...")
+        if DEBUG_MODE:
+            print(f"[DEBUG] Starting platform validation...")
         is_discord_cdn = ("cdn.discordapp.com" in content_lower or 
                          "media.discordapp.net" in content_lower or
                          "images-ext-1.discordapp.net" in content_lower or
@@ -1260,41 +1571,52 @@ async def setverifypaneltext(ctx, text_type: str, *, content: str):
         valid_extensions = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".mp4", ".mov", ".avi", ".webm", ".mkv"]
         has_valid_extension = any(content_lower.endswith(ext) for ext in valid_extensions)
         
-        # Debug: Show which validations passed/failed
-        print(f"[DEBUG] All platform checks completed")
-        print(f"[DEBUG] Final validation results:")
-        print(f"[DEBUG] - Discord CDN: {is_discord_cdn}")
-        print(f"[DEBUG] - WhatsApp: {is_whatsapp}")
-        print(f"[DEBUG] - Blob URL: {is_blob_url}")
-        print(f"[DEBUG] - Data URL: {is_data_url}")
-        print(f"[DEBUG] - GIF Platform: {is_gif_platform}")
-        print(f"[DEBUG] - Video Platform: {is_video_platform}")
-        print(f"[DEBUG] - Special Platform: {is_special_platform}")
-        print(f"[DEBUG] - Valid Extension: {has_valid_extension}")
-        
-        debug_info = f"🔍 **URL Validation Debug:**\n"
-        debug_info += f"URL: `{content[:100]}{'...' if len(content) > 100 else ''}`\n"
-        debug_info += f"Discord CDN: {'✅' if is_discord_cdn else '❌'}\n"
-        debug_info += f"WhatsApp: {'✅' if is_whatsapp else '❌'}\n"
-        debug_info += f"Blob URL: {'✅' if is_blob_url else '❌'}\n"
-        debug_info += f"Data URL: {'✅' if is_data_url else '❌'}\n"
-        debug_info += f"GIF Platform: {'✅' if is_gif_platform else '❌'}\n"
-        debug_info += f"Video Platform: {'✅' if is_video_platform else '❌'}\n"
-        debug_info += f"Special Platform: {'✅' if is_special_platform else '❌'}\n"
-        debug_info += f"Valid Extension: {'✅' if has_valid_extension else '❌'}\n"
+        # Security: Only show debug info in debug mode
+        if DEBUG_MODE:
+            print(f"[DEBUG] All platform checks completed")
+            print(f"[DEBUG] Final validation results:")
+            print(f"[DEBUG] - Discord CDN: {is_discord_cdn}")
+            print(f"[DEBUG] - WhatsApp: {is_whatsapp}")
+            print(f"[DEBUG] - Blob URL: {is_blob_url}")
+            print(f"[DEBUG] - Data URL: {is_data_url}")
+            print(f"[DEBUG] - GIF Platform: {is_gif_platform}")
+            print(f"[DEBUG] - Video Platform: {is_video_platform}")
+            print(f"[DEBUG] - Special Platform: {is_special_platform}")
+            print(f"[DEBUG] - Valid Extension: {has_valid_extension}")
         
         # Allow URL if it meets any of these criteria
         validation_passed = (is_discord_cdn or is_whatsapp or is_blob_url or is_data_url or 
                             is_gif_platform or is_video_platform or is_special_platform or has_valid_extension)
-        print(f"[DEBUG] Overall validation result: {validation_passed}")
+        
+        if DEBUG_MODE:
+            print(f"[DEBUG] Overall validation result: {validation_passed}")
         
         if not validation_passed:
+            # Security: Only show detailed debug info in debug mode
+            if DEBUG_MODE:
+                debug_info = f"🔍 **URL Validation Debug:**\n"
+                debug_info += f"URL: `{content[:100]}{'...' if len(content) > 100 else ''}`\n"
+                debug_info += f"Discord CDN: {'✅' if is_discord_cdn else '❌'}\n"
+                debug_info += f"WhatsApp: {'✅' if is_whatsapp else '❌'}\n"
+                debug_info += f"Blob URL: {'✅' if is_blob_url else '❌'}\n"
+                debug_info += f"Data URL: {'✅' if is_data_url else '❌'}\n"
+                debug_info += f"GIF Platform: {'✅' if is_gif_platform else '❌'}\n"
+                debug_info += f"Video Platform: {'✅' if is_video_platform else '❌'}\n"
+                debug_info += f"Special Platform: {'✅' if is_special_platform else '❌'}\n"
+                debug_info += f"Valid Extension: {'✅' if has_valid_extension else '❌'}\n"
+                
+                embed = discord.Embed(
+                    title="❌ Image URL Validation Failed",
+                    description=debug_info,
+                    color=discord.Color.red()
+                )
+            else:
+                embed = discord.Embed(
+                    title="❌ Image URL Validation Failed",
+                    description="The provided URL is not from a supported platform or doesn't have a valid extension.",
+                    color=discord.Color.red()
+                )
             
-            embed = discord.Embed(
-                title="❌ Image URL Validation Failed",
-                description=debug_info,
-                color=discord.Color.red()
-            )
             embed.add_field(
                 name="Supported URL Types",
                 value=(
@@ -1311,15 +1633,27 @@ async def setverifypaneltext(ctx, text_type: str, *, content: str):
             await ctx.send(embed=embed)
             return
         else:
-            # Success - show which validation passed
-            print(f"[DEBUG] Validation passed! Sending success message...")
-            success_embed = discord.Embed(
-                title="✅ Image URL Validation Passed",
-                description=debug_info,
-                color=discord.Color.green()
-            )
-            await ctx.send(embed=success_embed)
-            print(f"[DEBUG] Success message sent")
+            # Success - only show debug info in debug mode
+            if DEBUG_MODE:
+                print(f"[DEBUG] Validation passed! Sending success message...")
+                debug_info = f"🔍 **URL Validation Debug:**\n"
+                debug_info += f"URL: `{content[:100]}{'...' if len(content) > 100 else ''}`\n"
+                debug_info += f"Discord CDN: {'✅' if is_discord_cdn else '❌'}\n"
+                debug_info += f"WhatsApp: {'✅' if is_whatsapp else '❌'}\n"
+                debug_info += f"Blob URL: {'✅' if is_blob_url else '❌'}\n"
+                debug_info += f"Data URL: {'✅' if is_data_url else '❌'}\n"
+                debug_info += f"GIF Platform: {'✅' if is_gif_platform else '❌'}\n"
+                debug_info += f"Video Platform: {'✅' if is_video_platform else '❌'}\n"
+                debug_info += f"Special Platform: {'✅' if is_special_platform else '❌'}\n"
+                debug_info += f"Valid Extension: {'✅' if has_valid_extension else '❌'}\n"
+                
+                success_embed = discord.Embed(
+                    title="✅ Image URL Validation Passed",
+                    description=debug_info,
+                    color=discord.Color.green()
+                )
+                await ctx.send(embed=success_embed)
+                print(f"[DEBUG] Success message sent")
     
     if len(content) > 256 and text_type == "title":
         await ctx.send("Title must be 256 characters or less.")
@@ -1396,6 +1730,10 @@ async def resetverifypaneltext(ctx):
 async def sendverifypanel(ctx, channel: str = None):
     if not is_security_authorized(ctx):
         await ctx.message.delete()
+        return
+    
+    # Security: Rate limiting
+    if await _handle_security_rate_limit(ctx, "sendverifypanel"):
         return
 
     target_channel = ctx.channel
@@ -1521,6 +1859,11 @@ def _render_captcha_image(code: str) -> bytes:
 # Get bot token from environment variable
 bot_token = os.getenv("PLAYBOT")
 if not bot_token:
-    bot_token = "BOTTOKENHERE"  # Fallback to hardcoded token if env var not set
+    print("❌ CRITICAL ERROR: PLAYBOT environment variable not found!")
+    print("Please set your bot token as an environment variable:")
+    print("export PLAYBOT='your_bot_token_here'")
+    print("or create a .env file with: PLAYBOT=your_bot_token_here")
+    exit(1)
 
+print("✅ Bot token loaded from environment variable")
 bot.run(bot_token)
