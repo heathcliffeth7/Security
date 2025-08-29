@@ -450,22 +450,20 @@ def _safe_regex_search(compiled_pattern, text, timeout_seconds=1):
         
     return result[0]
 
-# Message moderation via regex
-@bot.event
-async def on_message(message: discord.Message):
+# Helper function for regex moderation (shared by on_message and on_message_edit)
+async def _check_message_against_regex(message: discord.Message):
+    """Check message against regex rules and delete if it matches"""
     # Ignore bot messages
     if message.author.bot:
         return
-    # If DM, do not process commands or moderation
+    # If DM, do not process moderation
     if message.guild is None:
         return
-    # Let command processor run only in guilds
-    if isinstance(bot.command_prefix, str) and message.content.startswith(bot.command_prefix):
-        await bot.process_commands(message)
-        return
+    
     guild_rules = regex_settings_by_guild.get(message.guild.id)
     if not guild_rules:
         return
+    
     channel_id = message.channel.id
     for rule in guild_rules.values():
         channels = rule.get("channels", set())
@@ -493,6 +491,24 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 print(f"[SECURITY] Unexpected error deleting message: {e}")
             break
+
+# Message moderation via regex
+@bot.event
+async def on_message(message: discord.Message):
+    # Let command processor run only in guilds
+    if message.guild and isinstance(bot.command_prefix, str) and message.content.startswith(bot.command_prefix):
+        await bot.process_commands(message)
+        return
+    
+    # Check message against regex rules
+    await _check_message_against_regex(message)
+
+# Message edit moderation via regex
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    """Check edited messages against regex rules"""
+    # Only check the edited message (after)
+    await _check_message_against_regex(after)
 
 # Button interaction handler - Add this to fix the interaction failed issue
 @bot.event
