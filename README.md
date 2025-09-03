@@ -71,7 +71,7 @@ SECURITY_MANAGER_ROLE_ID=your_security_role_id_here
 ### 3. Run the Bot
 
 ```bash
-python3 lastsecurity.py
+python3 security.py
 ```
 
 ## Discord Bot Setup
