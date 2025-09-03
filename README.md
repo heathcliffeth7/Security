@@ -4,12 +4,7 @@
 
 This Discord bot is an advanced moderation bot that offers comprehensive security features for your server. The bot includes new member filtering, regex-based message moderation, CAPTCHA verification system, and detailed security settings.
 
-## 🔧 System Requirements
 
-- **Python**: 3.8 or higher
-- **Operating System**: Linux, Windows, macOS
-- **RAM**: Minimum 512MB (recommended 1GB)
-- **Disk Space**: 100MB
 
 ## 📦 Installation
 
@@ -76,10 +71,10 @@ SECURITY_MANAGER_ROLE_ID=your_security_role_id_here
 ### 3. Run the Bot
 
 ```bash
-python3 lastsecurity.py
+python lastsecurity.py
 ```
 
-## 🔐 Discord Bot Setup
+## Discord Bot Setup
 
 ### Creating a Bot
 
@@ -117,12 +112,21 @@ The bot requires the following permissions to function properly:
 | Variable | Required | Description | Default |
 |----------|----------|-------------|---------|
 | `PLAYBOT` | ✅ | Discord bot token | - |
-| `SECURITY_MANAGER_ROLE_ID` | ❌ | Default security manager role ID | 0 |
+| `SECURITY_MANAGER_ROLE_ID` | ❌ | Default security manager role ID. Any user with this role gets automatic security access | 0 |
 | `DEBUG_MODE` | ❌ | Debug mode (true/false) | false |
 
 ### Initial Setup Steps
 
-1. **Add Security Manager**:
+1. **Setup Security Manager Role** (Recommended):
+   ```env
+   # In your .env file
+   SECURITY_MANAGER_ROLE_ID=123456789012345678
+   ```
+   - Create a role in Discord (e.g., "Security Manager")
+   - Copy the role ID and add it to your .env file
+   - All users with this role will automatically have security access
+
+2. **Alternative: Add Individual Authorization**:
    ```
    !securityauthorizedadd @YourRole
    ```
@@ -130,6 +134,9 @@ The bot requires the following permissions to function properly:
    ```
    !securityauthorizedadd 123456789012345678
    ```
+   - Use this if you don't want to set up a manager role
+   - Limited to maximum 4 authorized IDs (configurable in code: `MAX_SECURITY_AUTHORIZED_USERS = 4`)
+   - Each ID must be added individually
 
 2. **Set Verification Role** (for CAPTCHA):
    ```
@@ -138,31 +145,49 @@ The bot requires the following permissions to function properly:
 
 3. **Activate Security Filters**:
    ```
-   # Avatar control
-   !noavatarfilter on timeout 60
+   # Avatar control - Checks if new members have profile pictures
+   !noavatarfilter on kick          # Kicks members without avatar
+   !noavatarfilter on timeout 60    # Times out members without avatar for 60 minutes
+   !noavatarfilter on ban           # Bans members without avatar permanently
 
-   # Account age control
-   !accountagefilter on 7 timeout 120
+   # Account age control - Checks account creation date
+   !accountagefilter on 7 kick      # Kicks accounts younger than 7 days
+   !accountagefilter on 7 timeout 120 # Times out young accounts for 120 minutes
+   !accountagefilter on 7 ban       # Bans young accounts permanently
    ```
 
-## 🛡 Features and Commands
+## 🛡️ Features and Commands
 
 ### Security Filters
 
 #### Avatar Filter
-- Automatically filters new members without avatars
-- Actions: ban, kick, timeout
+- **Purpose**: Automatically filters new members without avatars when they join the server
+- **How it works**: Checks if new member has a profile picture (avatar) set
+- **Actions available**: 
+  - `ban` - Permanently ban the user from the server
+  - `kick` - Remove the user from the server (they can rejoin)
+  - `timeout` - Temporarily mute the user for specified minutes
+- **Use cases**: Prevents bot accounts, spam accounts, or low-effort joins
 ```bash
-!noavatarfilter on timeout 60  # 60 minute timeout
+!noavatarfilter on kick         # Kick users without avatar
+!noavatarfilter on timeout 60   # 60 minute timeout
+!noavatarfilter on ban          # Ban users without avatar
 !noavatarfilter off             # Disable filter
 ```
 
 #### Account Age Filter
-- Filters accounts younger than specified days
-- Actions: ban, kick, timeout
+- **Purpose**: Filters new members whose Discord accounts are younger than specified days
+- **How it works**: Calculates account age from account creation date to join date
+- **Actions available**:
+  - `ban` - Permanently ban young accounts from the server
+  - `kick` - Remove young accounts (they can rejoin when older)
+  - `timeout` - Temporarily mute young accounts for specified minutes
+- **Use cases**: Prevents throwaway accounts, spam bots, or accounts created just to raid servers
 ```bash
-!accountagefilter on 7 timeout 120  # 120 min timeout for accounts < 7 days
-!accountagefilter off                # Disable filter
+!accountagefilter on 7 kick          # Kick accounts < 7 days
+!accountagefilter on 7 timeout 120   # 120 min timeout for accounts < 7 days
+!accountagefilter on 7 ban           # Ban accounts < 7 days
+!accountagefilter off                 # Disable filter
 ```
 
 ### Regex Moderation
@@ -213,11 +238,42 @@ The bot requires the following permissions to function properly:
 
 ### Security Management
 
-#### Authorization
+#### Authorization System
+
+The bot uses a two-tier authorization system for security commands:
+
+##### 1. **Security Manager Role** (Primary Authorization)
+- **Purpose**: Default security role that automatically grants access to all security commands
+- **Setup**: Set via environment variable `SECURITY_MANAGER_ROLE_ID` in `.env` file
+- **Usage**: Any user with this role can use security commands without additional setup
+- **Example**:
+  ```env
+  SECURITY_MANAGER_ROLE_ID=123456789012345678
+  ```
+
+##### 2. **Authorized IDs** (Secondary Authorization)
+- **Purpose**: Manually added users or roles that get security command access
+- **Setup**: Added via `!securityauthorizedadd` command
+- **Limit**: Maximum 4 authorized IDs allowed
+- **Usage**: Individual users or roles that need security access but don't have the manager role
+
+##### **Key Differences**
+
+| Aspect | Security Manager Role | Authorized IDs |
+|--------|----------------------|----------------|
+| **Setup Method** | Environment variable (.env) | Bot command (!securityauthorizedadd) |
+| **Scope** | Server-wide role | Individual users/roles |
+| **Quantity** | 1 role (unlimited users) | Max 4 IDs |
+| **Persistence** | Always active | Saved to settings file |
+| **Management** | Manual file editing | Bot commands |
+| **Use Case** | Main security team | Additional moderators |
+
+##### **Authorization Commands**
 ```bash
 !securityauthorizedadd @SecurityRole    # Add role
 !securityauthorizedadd 123456789012345  # Add by ID
 !securityauthorizedremove @SecurityRole # Remove
+!securitysettings                       # View current authorization status
 ```
 
 #### Viewing Settings
@@ -307,7 +363,7 @@ This mode provides additional information:
    - Simple text CAPTCHA is used if PIL is not installed
    - Font files are automatically found from system paths
 
-##  Updates and Maintenance
+## 🔄 Updates and Maintenance
 
 ### Backing Up Settings
 
@@ -344,7 +400,7 @@ Bot shows important information in console output:
 - Security operation logs
 - Error messages
 
-## 🎯 Usage Examples
+## Usage Examples
 
 ### Basic Security Setup
 
@@ -353,7 +409,7 @@ Bot shows important information in console output:
 !securityauthorizedadd @SecurityManager
 
 # 2. Activate basic filters
-!noavatarfilter on timeout 30
+!noavatarfilter on kick
 !accountagefilter on 7 kick
 
 # 3. Add spam protection
@@ -457,7 +513,7 @@ VERIFY_MAX_ATTEMPTS = 10             # Maximum verification attempts
 !showverifypaneltext
 ```
 
-## 🔄 Updates and Maintenance
+## Updates and Maintenance
 
 ### Regular Maintenance
 
@@ -484,4 +540,16 @@ VERIFY_MAX_ATTEMPTS = 10             # Maximum verification attempts
 !securityaudit     # Recent security operations
 ```
 
+
+
+## Quick Start Summary
+
+1. **Install Dependencies**: `pip install -r requirements.txt`
+2. **Create .env file**: Add your `PLAYBOT=your_token_here`
+3. **Run Bot**: `python lastsecurity.py`
+4. **Setup Security**: Use `!securityauthorizedadd @YourRole` to get started
+
+**That's it!** Your Discord security bot is ready to protect your server.
+
+---
 
