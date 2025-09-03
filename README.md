@@ -71,14 +71,12 @@ PLAYBOT=your_bot_token_here
 # Security manager role ID (optional)
 SECURITY_MANAGER_ROLE_ID=your_security_role_id_here
 
-# Debug mode (optional, default: false)
-DEBUG_MODE=false
-```
+
 
 ### 3. Run the Bot
 
 ```bash
-python lastsecurity.py
+python3 lastsecurity.py
 ```
 
 ## 🔐 Discord Bot Setup
