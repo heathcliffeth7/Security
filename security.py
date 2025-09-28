@@ -76,6 +76,36 @@ def _parse_role_ids(env_value: str | None) -> Set[int]:
     return ids
 
 
+def _chunk_message_lines(lines: list[str], limit: int = 1900):
+    """Yield message chunks that respect Discord's character limit."""
+    chunk: list[str] = []
+    length = 0
+    for raw_line in lines:
+        line = str(raw_line) if raw_line is not None else ""
+        if len(line) > limit:
+            if chunk:
+                yield "\n".join(chunk)
+                chunk = []
+                length = 0
+            for start in range(0, len(line), limit):
+                yield line[start : start + limit]
+            continue
+        if not chunk:
+            chunk.append(line)
+            length = len(line)
+            continue
+        addition = 1 + len(line)
+        if length + addition > limit:
+            yield "\n".join(chunk)
+            chunk = [line]
+            length = len(line)
+        else:
+            chunk.append(line)
+            length += addition
+    if chunk:
+        yield "\n".join(chunk)
+
+
 security_authorized_role_ids: Set[int] = _parse_role_ids(os.getenv("SECURITY_MANAGER_ROLE_ID"))
 if not security_authorized_role_ids:
     print("⚠️  WARNING: SECURITY_MANAGER_ROLE_ID environment variable not set or invalid!")
@@ -1368,33 +1398,37 @@ async def regexsettings(ctx, regexsettingsname: str = None):
         exempt_roles = rule.get("exempt_roles", set())
         status = "Active" if channels else "Inactive"
 
-        embed = discord.Embed(title=f"Regex Settings - {regexsettingsname}", color=discord.Color.blue())
-        embed.add_field(name="Status", value=status, inline=False)
-        embed.add_field(name="Pattern", value=f"`{pattern_text}`", inline=False)
-        embed.add_field(name="Applied Channels", value=_mentions_list(channels, "channel"), inline=False)
-        embed.add_field(name="Exempt Users", value=_mentions_list(exempt_users, "user"), inline=False)
-        embed.add_field(name="Exempt Roles", value=_mentions_list(exempt_roles, "role"), inline=False)
-        await ctx.send(embed=embed)
+        lines = [
+            f"🔍 Regex Setting `{regexsettingsname}`",
+            f"Status: {status}",
+            f"Pattern: `{pattern_text}`",
+            f"Applied Channels: {_mentions_list(channels, 'channel')}",
+            f"Exempt Users: {_mentions_list(exempt_users, 'user')}",
+            f"Exempt Roles: {_mentions_list(exempt_roles, 'role')}",
+        ]
+        for chunk in _chunk_message_lines(lines):
+            await ctx.send(chunk)
         return
 
-    # List all rules
-    embed = discord.Embed(title="Regex Settings", color=discord.Color.blue())
+    lines = ["📋 Regex Settings"]
     for name_key, rule in guild_rules.items():
         pattern_text = rule.get("pattern", "-")
         channels = rule.get("channels", set())
         exempt_users = rule.get("exempt_users", set())
         exempt_roles = rule.get("exempt_roles", set())
         status = "Active" if channels else "Inactive"
-        value = (
-            f"Status: {status}\n"
-            f"Pattern: `{pattern_text}`\n"
-            f"Channels: {_mentions_list(channels, 'channel')}\n"
-            f"Exempt Users: {_mentions_list(exempt_users, 'user')}\n"
-            f"Exempt Roles: {_mentions_list(exempt_roles, 'role')}"
-        )
-        embed.add_field(name=name_key, value=value, inline=False)
+        lines.extend([
+            "",
+            f"• {name_key}",
+            f"  Status: {status}",
+            f"  Pattern: `{pattern_text}`",
+            f"  Channels: {_mentions_list(channels, 'channel')}",
+            f"  Exempt Users: {_mentions_list(exempt_users, 'user')}",
+            f"  Exempt Roles: {_mentions_list(exempt_roles, 'role')}",
+        ])
 
-    await ctx.send(embed=embed)
+    for chunk in _chunk_message_lines(lines):
+        await ctx.send(chunk)
 
 # Delete a regex setting by name
 @bot.command(name="delregexsettings")
