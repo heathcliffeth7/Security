@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 import dotenv   # For .env file support
 import re
 import random
@@ -9,10 +9,15 @@ import string
 import io
 import asyncio
 from collections import defaultdict
+import shlex
+from difflib import SequenceMatcher
 import time
 import signal
 import threading
 import json
+import copy
+from pathlib import Path
+from typing import List, Optional, Set
 _PIL_AVAILABLE = False
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -56,11 +61,26 @@ async def _block_dm_commands(ctx: commands.Context) -> bool:
 
 # Security Authorization
 # Load security role ID from environment variable for better security
-security_authorized_role_id = int(os.getenv("SECURITY_MANAGER_ROLE_ID", "0"))
-if security_authorized_role_id == 0:
-    print("⚠️  WARNING: SECURITY_MANAGER_ROLE_ID environment variable not set!")
+def _parse_role_ids(env_value: str | None) -> Set[int]:
+    ids: Set[int] = set()
+    if not env_value:
+        return ids
+    for token in env_value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            ids.add(int(token))
+        except ValueError:
+            print(f"⚠️  WARNING: Invalid SECURITY_MANAGER_ROLE_ID entry ignored: {token!r}")
+    return ids
+
+
+security_authorized_role_ids: Set[int] = _parse_role_ids(os.getenv("SECURITY_MANAGER_ROLE_ID"))
+if not security_authorized_role_ids:
+    print("⚠️  WARNING: SECURITY_MANAGER_ROLE_ID environment variable not set or invalid!")
     print("Security commands will only work with manually added IDs via !securityauthorizedadd")
-    print("To set a default security role: export SECURITY_MANAGER_ROLE_ID='your_role_id_here'")
+    print("To set default security roles: export SECURITY_MANAGER_ROLE_ID='id1,id2,...'")
 
 security_authorized_ids = set()
 
@@ -110,6 +130,22 @@ VERIFY_MAX_ATTEMPTS = 10  # Maximum verify attempts per user
 captcha_rate_limit_messages = defaultdict(float)  # Tracks when captcha rate limit message was last sent
 CAPTCHA_RATE_LIMIT_MESSAGE_COOLDOWN = 60  # Show captcha rate limit message once per minute
 
+# Spam violation statistics configuration
+SPAM_STATS_FILE = Path(__file__).with_name("spam_violation_stats.json")
+SPAM_AGGREGATE_WINDOWS = [
+    ("24h", 1),
+    ("7d", 7),
+    ("30d", 30),
+    ("90d", 90),
+    ("120d", 120),
+    ("180d", 180),
+    ("360d", 360),
+]
+MAX_SPAM_AGGREGATE_DAYS = 360
+spam_violation_stats = {}
+spam_stats_loaded = False
+spam_stats_lock = asyncio.Lock()
+
 # ============== SECURITY SETTINGS PERSISTENCE ==============
 
 def save_security_settings():
@@ -125,6 +161,23 @@ def save_security_settings():
                     "channels": list(rule_data.get("channels", set())),
                     "exempt_users": list(rule_data.get("exempt_users", set())),
                     "exempt_roles": list(rule_data.get("exempt_roles", set()))
+                }
+        
+        # Serialize spam rules
+        serializable_spam_rules = {}
+        for guild_id, guild_rules in spam_rules_by_guild.items():
+            serializable_spam_rules[str(guild_id)] = {}
+            for rule_name, rule_data in guild_rules.items():
+                serializable_spam_rules[str(guild_id)][rule_name] = {
+                    "label": rule_data.get("label", rule_name),
+                    "min_length": rule_data.get("min_length", 0),
+                    "similarity_threshold": rule_data.get("similarity_threshold", 0.0),
+                    "time_window": rule_data.get("time_window", 0),
+                    "message_count": rule_data.get("message_count", 0),
+                    "dm_message": rule_data.get("dm_message", ""),
+                    "notify_channel_id": rule_data.get("notify_channel_id"),
+                    "channels": list(rule_data.get("channels", set())),
+                    "nonreply_only": rule_data.get("nonreply_only", False)
                 }
         
         # Serialize captcha panel texts
@@ -156,6 +209,9 @@ def save_security_settings():
             # Regex Settings
             "regex_settings_by_guild": serializable_regex_settings,
             
+            # Spam Settings
+            "spam_rules_by_guild": serializable_spam_rules,
+            
             # Verify button usage (for statistics only)
             "verify_button_usage": dict(verify_button_usage)
         }
@@ -185,7 +241,7 @@ def load_security_settings():
     global no_avatar_filter_enabled, no_avatar_action, no_avatar_timeout_duration
     global account_age_filter_enabled, account_age_min_days, account_age_action, account_age_timeout_duration
     global security_authorized_ids, captcha_verify_role_id, captcha_panel_texts
-    global regex_settings_by_guild, verify_button_usage
+    global regex_settings_by_guild, verify_button_usage, spam_rules_by_guild
     
     try:
         if not os.path.exists(SECURITY_SETTINGS_FILE):
@@ -253,6 +309,41 @@ def load_security_settings():
             except ValueError:
                 print(f"[SECURITY] Warning: Invalid guild ID in regex settings: {guild_id_str}")
         
+        # Spam Settings
+        spam_data = settings_data.get("spam_rules_by_guild", {})
+        spam_rules_by_guild.clear()
+        for guild_id_str, guild_rules in spam_data.items():
+            try:
+                guild_id = int(guild_id_str)
+            except ValueError:
+                print(f"[SECURITY] Warning: Invalid guild ID in spam settings: {guild_id_str}")
+                continue
+            spam_rules_by_guild[guild_id] = {}
+            for rule_name, rule_data in guild_rules.items():
+                try:
+                    label = str(rule_data.get("label", rule_name))
+                    min_length = int(rule_data.get("min_length", 0))
+                    similarity_threshold = float(rule_data.get("similarity_threshold", 0.0))
+                    time_window = int(rule_data.get("time_window", 0))
+                    message_count = int(rule_data.get("message_count", 0))
+                    dm_message = str(rule_data.get("dm_message", ""))
+                    notify_channel_id = rule_data.get("notify_channel_id")
+                    if notify_channel_id is not None:
+                        notify_channel_id = int(notify_channel_id)
+                    spam_rules_by_guild[guild_id][rule_name] = {
+                        "label": label,
+                        "min_length": max(0, min_length),
+                        "similarity_threshold": max(0.0, min(similarity_threshold, 1.0)),
+                        "time_window": max(0, time_window),
+                        "message_count": max(0, message_count),
+                        "dm_message": dm_message,
+                        "notify_channel_id": notify_channel_id,
+                        "channels": set(rule_data.get("channels", [])),
+                        "nonreply_only": _coerce_bool(rule_data.get("nonreply_only", False))
+                    }
+                except Exception as e:
+                    print(f"[SECURITY] Warning: Could not load spam rule '{rule_name}' for guild {guild_id_str}: {e}")
+        
         # Verify button usage
         usage_data = settings_data.get("verify_button_usage", {})
         verify_button_usage.clear()
@@ -280,16 +371,154 @@ def load_security_settings():
         print(f"  - Captcha role ID: {captcha_verify_role_id}")
         print(f"  - Panel texts for {len(captcha_panel_texts)} guilds")
         print(f"  - Regex rules for {len(regex_settings_by_guild)} guilds")
+        if spam_rules_by_guild:
+            total_spam_rules = sum(len(rules) for rules in spam_rules_by_guild.values())
+            print(f"  - Spam rules: {total_spam_rules} rules in {len(spam_rules_by_guild)} guilds")
         print(f"  - Verify button usage for {len(verify_button_usage)} users")
-        
+
         return True
-        
+
     except Exception as e:
         print(f"[SECURITY] Error loading settings: {e}")
         return False
 
+
+def load_spam_violation_stats():
+    """Load persisted spam violation statistics from disk."""
+    global spam_violation_stats, spam_stats_loaded
+    try:
+        if SPAM_STATS_FILE.exists():
+            with open(SPAM_STATS_FILE, "r", encoding="utf-8") as handle:
+                spam_violation_stats = json.load(handle)
+        else:
+            spam_violation_stats = {}
+    except Exception as exc:
+        print(f"[SECURITY] Error loading spam stats: {exc}")
+        spam_violation_stats = {}
+    finally:
+        spam_stats_loaded = True
+
+
+def _parse_date_key(date_str):
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _prune_spam_daily_counts(daily_counts):
+    """Keep only the most recent configured number of days in daily counts."""
+    if not daily_counts:
+        return
+    today = datetime.utcnow().date()
+    cutoff = today - timedelta(days=MAX_SPAM_AGGREGATE_DAYS - 1)
+    stale_keys = []
+    for key in list(daily_counts.keys()):
+        date_obj = _parse_date_key(key)
+        if date_obj is None or date_obj < cutoff:
+            stale_keys.append(key)
+    for key in stale_keys:
+        daily_counts.pop(key, None)
+
+
+def _calculate_spam_aggregates(daily_counts):
+    """Calculate window aggregates from per-day counts."""
+    aggregates = {}
+    today = datetime.utcnow().date()
+    for label, days in SPAM_AGGREGATE_WINDOWS:
+        cutoff = today - timedelta(days=days - 1)
+        total = 0
+        for key, value in daily_counts.items():
+            date_obj = _parse_date_key(key)
+            if date_obj is None:
+                continue
+            if date_obj >= cutoff:
+                try:
+                    total += int(value)
+                except (TypeError, ValueError):
+                    continue
+        aggregates[label] = total
+    return aggregates
+
+
+async def _save_spam_violation_stats():
+    """Persist spam violation statistics to disk."""
+    async with spam_stats_lock:
+        snapshot = copy.deepcopy(spam_violation_stats)
+
+    def _write_snapshot():
+        try:
+            temp_path = SPAM_STATS_FILE.with_suffix(".tmp")
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                json.dump(snapshot, handle, indent=2, ensure_ascii=False)
+            temp_path.replace(SPAM_STATS_FILE)
+        except Exception as exc:
+            print(f"[SECURITY] Error saving spam stats: {exc}")
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _write_snapshot)
+
+
+async def record_spam_violation(guild_id, user_id, rule_key, label=""):
+    """Record a spam violation and update rolling aggregates."""
+    global spam_stats_loaded
+    if not spam_stats_loaded:
+        load_spam_violation_stats()
+
+    today_key = datetime.utcnow().strftime("%Y-%m-%d")
+
+    async with spam_stats_lock:
+        guild_key = str(guild_id)
+        user_key = str(user_id)
+        guild_bucket = spam_violation_stats.setdefault(guild_key, {})
+        user_bucket = guild_bucket.setdefault(user_key, {})
+        rule_bucket = user_bucket.setdefault(rule_key, {
+            "label": label or rule_key,
+            "daily_counts": {},
+            "aggregates": {},
+        })
+
+        rule_bucket["label"] = label or rule_bucket.get("label") or rule_key
+
+        daily_counts = rule_bucket.setdefault("daily_counts", {})
+        daily_counts[today_key] = int(daily_counts.get(today_key, 0)) + 1
+
+        _prune_spam_daily_counts(daily_counts)
+        rule_bucket["aggregates"] = _calculate_spam_aggregates(daily_counts)
+        rule_bucket["last_updated"] = today_key
+
+    await _save_spam_violation_stats()
+
+
+async def remove_spam_violation_stats_for_rule(guild_id, rule_key):
+    """Remove stored violation statistics for a specific rule."""
+    global spam_stats_loaded
+    if not spam_stats_loaded:
+        load_spam_violation_stats()
+
+    guild_key = str(guild_id)
+    async with spam_stats_lock:
+        guild_bucket = spam_violation_stats.get(guild_key)
+        if not guild_bucket:
+            return
+
+        empty_users = []
+        for user_key, user_bucket in guild_bucket.items():
+            if rule_key in user_bucket:
+                user_bucket.pop(rule_key, None)
+            if not user_bucket:
+                empty_users.append(user_key)
+
+        for user_key in empty_users:
+            guild_bucket.pop(user_key, None)
+
+        if not guild_bucket:
+            spam_violation_stats.pop(guild_key, None)
+
+    await _save_spam_violation_stats()
+
 def is_security_authorized(ctx):
-    if security_authorized_role_id in [role.id for role in ctx.author.roles]:
+    if security_authorized_role_ids and any(role.id in security_authorized_role_ids for role in ctx.author.roles):
         return True
     if ctx.author.id in security_authorized_ids:
         return True
@@ -361,6 +590,46 @@ account_age_timeout_duration = None
 # Regex moderation settings per guild
 # Structure: { guild_id: { name: {"pattern": str, "compiled": Pattern, "channels": set[int], "exempt_users": set[int], "exempt_roles": set[int]} } }
 regex_settings_by_guild = {}
+
+# Spam moderation settings per guild
+# Structure: { guild_id: { name: {"min_length": int, "similarity_threshold": float, "time_window": int, "message_count": int, "dm_message": str, "notify_channel_id": int, "channels": set[int], "nonreply_only": bool} } }
+spam_rules_by_guild = {}
+
+
+def _coerce_bool(value) -> bool:
+    """Coerce various truthy representations into a real boolean."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+        return bool(lowered)
+    if isinstance(value, (int, float)):
+        return value != 0
+    return bool(value)
+
+# Commonly used time windows supported out-of-the-box (value in seconds)
+SPAM_RULE_PREDEFINED_WINDOWS = {
+    "24h": 24 * 3600,
+    "7d": 7 * 86400,
+    "30d": 30 * 86400,
+    "60d": 60 * 86400,
+    "90d": 90 * 86400,
+    "120d": 120 * 86400,
+    "180d": 180 * 86400,
+    "360d": 360 * 86400,
+}
+
+# Runtime spam tracking (not persisted)
+# Key: (guild_id, user_id) -> list[{"timestamp": float, "content": str}]
+spam_message_history = defaultdict(list)
+
+# Last trigger timestamps to prevent duplicate alerts within the window
+# Key: (guild_id, user_id, rule_name) -> float
+spam_rule_trigger_log = {}
 
 
 def _parse_pattern_and_flags(raw_text):
@@ -450,47 +719,290 @@ def _safe_regex_search(compiled_pattern, text, timeout_seconds=1):
         
     return result[0]
 
+def _collect_regex_text_blocks(
+    message: discord.Message,
+    *,
+    _seen: Optional[Set[int]] = None
+) -> List[str]:
+    """Return textual fragments that should be scanned by regex rules."""
+    blocks: List[str] = []
+    seen: Set[int] = _seen or set()
+
+    message_id = getattr(message, "id", None)
+    if message_id is not None:
+        if message_id in seen:
+            return blocks
+        seen.add(message_id)
+
+    content = getattr(message, "content", None)
+    if content:
+        blocks.append(content)
+
+    for embed in getattr(message, "embeds", []) or []:
+        title = getattr(embed, "title", None)
+        if title:
+            blocks.append(title)
+        description = getattr(embed, "description", None)
+        if description:
+            blocks.append(description)
+        for field in getattr(embed, "fields", []) or []:
+            field_name = getattr(field, "name", None)
+            field_value = getattr(field, "value", None)
+            if field_name:
+                blocks.append(field_name)
+            if field_value:
+                blocks.append(field_value)
+        footer = getattr(embed, "footer", None)
+        if footer and getattr(footer, "text", None):
+            blocks.append(footer.text)
+        author = getattr(embed, "author", None)
+        if author and getattr(author, "name", None):
+            blocks.append(author.name)
+
+    reference = getattr(message, "reference", None)
+    if reference:
+        resolved = getattr(reference, "resolved", None)
+        cached = getattr(reference, "cached_message", None)
+        target = None
+        if isinstance(resolved, discord.Message):
+            target = resolved
+        elif isinstance(cached, discord.Message):
+            target = cached
+        if target is not None:
+            blocks.extend(_collect_regex_text_blocks(target, _seen=seen))
+
+    return [block for block in blocks if isinstance(block, str) and block.strip()]
+
+
 # Helper function for regex moderation (shared by on_message and on_message_edit)
 async def _check_message_against_regex(message: discord.Message):
     """Check message against regex rules and delete if it matches"""
-    # Ignore bot messages
     if message.author.bot:
         return
-    # If DM, do not process moderation
     if message.guild is None:
         return
-    
+
+    text_blocks = _collect_regex_text_blocks(message)
+    if not text_blocks:
+        return
+
     guild_rules = regex_settings_by_guild.get(message.guild.id)
     if not guild_rules:
         return
-    
+
     channel_id = message.channel.id
     for rule in guild_rules.values():
         channels = rule.get("channels", set())
         compiled = rule.get("compiled")
         if not compiled or not channels:
             continue
-        # Security: Use safe regex search to prevent ReDoS attacks
-        if channel_id in channels and _safe_regex_search(compiled, message.content or ""):
-            # Exemptions: users or roles
-            exempt_users = rule.get("exempt_users", set())
-            exempt_roles = rule.get("exempt_roles", set())
-            if message.author.id in exempt_users:
-                continue
-            author_roles = getattr(message.author, "roles", [])
-            if any(r.id in exempt_roles for r in author_roles):
-                continue
+        if channel_id not in channels:
+            continue
+
+        if not any(_safe_regex_search(compiled, text) for text in text_blocks):
+            continue
+
+        exempt_users = rule.get("exempt_users", set())
+        if message.author.id in exempt_users:
+            continue
+        exempt_roles = rule.get("exempt_roles", set())
+        author_roles = getattr(message.author, "roles", [])
+        if any(r.id in exempt_roles for r in author_roles):
+            continue
+
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            print(f"[SECURITY] Bot lacks permission to delete message in {message.channel}")
+        except discord.NotFound:
+            print(f"[SECURITY] Message already deleted in {message.channel}")
+        except discord.HTTPException as e:
+            print(f"[SECURITY] HTTP error deleting message: {e}")
+        except Exception as e:
+            print(f"[SECURITY] Unexpected error deleting message: {e}")
+        break
+
+def _is_message_reply(message: discord.Message) -> bool:
+    """
+    Return True if message is a Discord reply (covers uncached targets).
+
+    This function checks multiple indicators to determine if a message is a reply:
+    1. Checks if message has a reference object
+    2. Checks if reference contains resolved message data
+    3. Checks if reference contains message/channel/guild IDs
+    4. Checks if message type is explicitly marked as reply
+
+    Args:
+        message: Discord Message object to check
+
+    Returns:
+        bool: True if message is a reply, False otherwise
+    """
+    ref = getattr(message, "reference", None)
+    if ref is not None:
+        # Discord replies always include a reference payload; treat any reference as a reply
+        if getattr(ref, "resolved", None) is not None:
+            return True
+        if any(getattr(ref, attr, None) for attr in ("message_id", "channel_id", "guild_id")):
+            return True
+        return True
+    try:
+        if message.type == discord.MessageType.reply:
+            return True
+    except AttributeError:
+        pass
+    return False
+
+
+async def _check_message_against_spam_rules(message: discord.Message):
+    """Check message against custom spam rules and apply configured actions"""
+    if message.author.bot:
+        return
+    if message.guild is None:
+        return
+
+    # Skip security managers / authorized users
+    author_roles = getattr(message.author, "roles", []) or []
+    if security_authorized_role_ids and any(r.id in security_authorized_role_ids for r in author_roles):
+        return
+    if message.author.id in security_authorized_ids:
+        return
+    if any(r.id in security_authorized_ids for r in author_roles):
+        return
+
+    guild_rules = spam_rules_by_guild.get(message.guild.id)
+    if not guild_rules:
+        return
+
+    content = message.content or ""
+    if not content:
+        return
+
+    now = time.time()
+    history_key = (message.guild.id, message.author.id)
+    user_history = spam_message_history[history_key]
+
+    is_reply = _is_message_reply(message)
+
+    max_window = 0
+    for rule in guild_rules.values():
+        window = rule.get("time_window", 0)
+        if window > max_window:
+            max_window = window
+
+    if max_window > 0:
+        user_history[:] = [entry for entry in user_history if now - entry["timestamp"] <= max_window]
+    else:
+        user_history.clear()
+
+    user_history.append({
+        "timestamp": now,
+        "content": content,
+        "is_reply": is_reply,
+        "channel_id": message.channel.id,
+    })
+
+    for name_key, rule in guild_rules.items():
+        channels = rule.get("channels", set())
+        if channels and message.channel.id not in channels:
+            continue
+
+        nonreply_only = rule.get("nonreply_only", False)
+        # Skip this rule for reply messages if nonreply_only is enabled
+        if nonreply_only and is_reply:
+            continue
+
+        min_length = rule.get("min_length", 0)
+        if min_length and len(content) <= min_length:
+            continue
+
+        time_window = rule.get("time_window", 0)
+        if time_window <= 0:
+            continue
+
+        message_count = rule.get("message_count", 0)
+        if message_count <= 1:
+            continue
+
+        similarity_threshold = rule.get("similarity_threshold", 0.0)
+        if similarity_threshold <= 0:
+            continue
+
+        relevant_messages = [
+            entry
+            for entry in user_history
+            if now - entry["timestamp"] <= time_window
+            and (
+                not channels
+                or entry.get("channel_id") is None
+                or entry["channel_id"] in channels
+            )
+        ]
+        # Filter out reply messages for nonreply_only rules
+        if nonreply_only:
+            relevant_messages = [
+                entry for entry in relevant_messages
+                if not _coerce_bool(entry.get("is_reply", False))
+            ]
+        if len(relevant_messages) < message_count:
+            continue
+
+        similar_count = 0
+        for entry in relevant_messages:
+            ratio = SequenceMatcher(None, content, entry["content"]).ratio()
+            if ratio >= similarity_threshold:
+                similar_count += 1
+        if similar_count >= message_count:
+            await _handle_spam_rule_trigger(message, name_key, rule)
+            continue
+
+async def _handle_spam_rule_trigger(message: discord.Message, rule_key: str, rule: dict):
+    """Execute actions when a spam rule is triggered"""
+    guild_id = message.guild.id
+    user_id = message.author.id
+    now = time.time()
+
+    cooldown = max(rule.get("time_window", 0), 60)
+    last_trigger = spam_rule_trigger_log.get((guild_id, user_id, rule_key))
+    if last_trigger and now - last_trigger < cooldown:
+        return
+
+    spam_rule_trigger_log[(guild_id, user_id, rule_key)] = now
+
+    await record_spam_violation(guild_id, user_id, rule_key, label=rule.get("label", rule_key))
+
+    dm_message = rule.get("dm_message")
+    if dm_message:
+        try:
+            await message.author.send(dm_message)
+        except discord.Forbidden:
+            print(f"[SECURITY] Unable to DM user {user_id} for spam rule '{rule_key}'")
+        except discord.HTTPException as e:
+            print(f"[SECURITY] HTTP error sending DM: {e}")
+        except Exception as e:
+            print(f"[SECURITY] Unexpected error sending DM: {e}")
+
+    notify_channel_id = rule.get("notify_channel_id")
+    if notify_channel_id:
+        channel = message.guild.get_channel(notify_channel_id)
+        if channel:
+            label = rule.get("label", rule_key)
+            window_seconds = rule.get("time_window", 0)
             try:
-                await message.delete()
-            except discord.Forbidden:
-                print(f"[SECURITY] Bot lacks permission to delete message in {message.channel}")
-            except discord.NotFound:
-                print(f"[SECURITY] Message already deleted in {message.channel}")
+                preview = message.content[:1500].strip()
+                if not preview:
+                    preview = "(no content)"
+                await channel.send(
+                    f"⚠️ Spam rule `{label}` triggered by {message.author.mention} in {message.channel.mention}.\n"
+                    f"Window: {window_seconds} seconds | Similarity ≥ {int(rule.get('similarity_threshold', 0.0) * 100)}% | Count ≥ {rule.get('message_count', 0)}\n"
+                    f"Recent message:\n```{preview}```"
+                )
             except discord.HTTPException as e:
-                print(f"[SECURITY] HTTP error deleting message: {e}")
+                print(f"[SECURITY] HTTP error notifying channel {notify_channel_id}: {e}")
             except Exception as e:
-                print(f"[SECURITY] Unexpected error deleting message: {e}")
-            break
+                print(f"[SECURITY] Unexpected error notifying channel {notify_channel_id}: {e}")
+        else:
+            print(f"[SECURITY] Notification channel {notify_channel_id} not found for spam rule '{rule_key}'")
 
 # Message moderation via regex
 @bot.event
@@ -502,6 +1014,9 @@ async def on_message(message: discord.Message):
     
     # Check message against regex rules
     await _check_message_against_regex(message)
+
+    # Check custom spam rules
+    await _check_message_against_spam_rules(message)
 
 # Message edit moderation via regex
 @bot.event
@@ -768,6 +1283,7 @@ async def set_regex_exempt(ctx, regexsettingsname: str, kind: str, *, targets: s
         return
     tokens = targets.replace(",", " ").split()
     selected: set[int] = set()
+    display_labels: list[str] = []
     invalid = []
     for tok in tokens:
         raw = tok.strip()
@@ -790,22 +1306,24 @@ async def set_regex_exempt(ctx, regexsettingsname: str, kind: str, *, targets: s
             if role is None:
                 invalid.append(tok)
                 continue
+            display_labels.append(role.name or f"Role {role.id}")
         else:
             member = ctx.guild.get_member(_id)
             if member is None:
                 invalid.append(tok)
                 continue
+            display_labels.append(member.mention)
         selected.add(_id)
     if not selected:
         await ctx.send("Please specify valid targets. Examples:\n- `!setregexexempt spam users @alice @bob`\n- `!setregexexempt spam roles @Admin 123456789012345678`")
         return
     if kind_l == "roles":
         guild_rules[name_key]["exempt_roles"] = selected
-        mentions = ", ".join(f"<@&{i}>" for i in selected)
-        msg = f"Exempt roles updated for `{regexsettingsname}`: {mentions}"
+        names = ", ".join(display_labels)
+        msg = f"Exempt roles updated for `{regexsettingsname}`: {names}"
     else:
         guild_rules[name_key]["exempt_users"] = selected
-        mentions = ", ".join(f"<@{i}>" for i in selected)
+        mentions = ", ".join(display_labels)
         msg = f"Exempt users updated for `{regexsettingsname}`: {mentions}"
     
     # Save settings
@@ -904,6 +1422,380 @@ async def delregexsettings(ctx, regexsettingsname: str):
     save_security_settings()
     
     await ctx.send(f"Regex setting deleted: `{regexsettingsname}`")
+
+@bot.command(name="spamrule")
+async def spamrule(ctx, rulename: str, *, rule_spec: str = ""):
+    """Create or update a spam rule with similarity detection"""
+    if not is_security_authorized(ctx):
+        await ctx.message.delete()
+        return
+
+    if ctx.guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if await _handle_security_rate_limit(ctx, "spamrule"):
+        return
+
+    rule_spec = (rule_spec or "").strip()
+    if not rule_spec:
+        await ctx.send(
+            "Please provide rule details. Example: `!spamrule test characters>30 %80 24h message>3 dm \"Your DM\" modlogchannel #alerts`."
+        )
+        return
+
+    try:
+        parts = shlex.split(rule_spec)
+    except ValueError as exc:
+        await ctx.send(f"Unable to parse command parameters: {exc}")
+        return
+
+    if len(parts) < 6:
+        await ctx.send(
+            "Invalid format. Expected `characters>`, `%`, `<duration>`, `message>`, `dm`, then your DM text and channels."
+        )
+        return
+
+    length_token = parts.pop(0)
+    length_match = re.fullmatch(r"characters\s*>\s*(\d+)", length_token, flags=re.IGNORECASE)
+    if not length_match:
+        await ctx.send("Specify minimum characters like `characters>30`.")
+        return
+    min_length = int(length_match.group(1))
+
+    similarity_token = parts.pop(0)
+    similarity_match = None
+    for pattern in (r"%\s*(\d+(?:\.\d+)?)", r"(\d+(?:\.\d+)?)%", r"similarity\s*>\s*(\d+(?:\.\d+)?)"):
+        similarity_match = re.fullmatch(pattern, similarity_token, flags=re.IGNORECASE)
+        if similarity_match:
+            break
+    if not similarity_match:
+        await ctx.send("Specify similarity like `%80` or `80%`.")
+        return
+    similarity_value = float(similarity_match.group(1))
+    similarity_threshold = max(0.0, min(similarity_value / 100.0, 1.0))
+
+    duration_token = parts.pop(0).lower()
+    duration_display = duration_token
+    time_window = SPAM_RULE_PREDEFINED_WINDOWS.get(duration_token)
+    if time_window is not None:
+        duration_match = re.fullmatch(r"(\d+)([a-z]+)", duration_token)
+    else:
+        duration_match = re.fullmatch(r"(\d+)([smhd])", duration_token)
+        if not duration_match:
+            await ctx.send("Specify time window like `24h`, `7d`, or `120s`.")
+            return
+        window_value = int(duration_match.group(1))
+        window_unit = duration_match.group(2)
+        unit_multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+        time_window = window_value * unit_multipliers[window_unit]
+        duration_display = f"{window_value}{window_unit}"
+
+    message_token = parts.pop(0)
+    message_match = re.fullmatch(r"messages?\s*>\s*(\d+)", message_token, flags=re.IGNORECASE)
+    if not message_match:
+        await ctx.send("Specify message threshold like `message>3` or `messages>3`.")
+        return
+    message_count = int(message_match.group(1))
+
+    if not parts:
+        await ctx.send("Please include `dm` followed by the message to send.")
+        return
+
+    dm_token = parts.pop(0)
+    if dm_token.lower() != "dm":
+        await ctx.send("Expected `dm` keyword right after the threshold parameters.")
+        return
+
+    KEYWORDS = {"modlogchannel", "specchannel", "nonreply"}
+
+    def _is_keyword(token: str) -> bool:
+        lowered = token.lower()
+        return lowered in KEYWORDS or lowered.startswith("nonreply")
+
+    dm_tokens: list[str] = []
+    while parts and not _is_keyword(parts[0]):
+        dm_tokens.append(parts.pop(0))
+
+    if not dm_tokens:
+        await ctx.send("Provide the message to send via DM after the `dm` keyword (wrap in quotes if it has spaces).")
+        return
+
+    dm_message = " ".join(dm_tokens).strip()
+    if not dm_message:
+        await ctx.send("Provide the message to send via DM after the `dm` keyword (wrap in quotes if it has spaces).")
+        return
+
+    def _resolve_channel(token: str) -> discord.abc.GuildChannel | None:
+        raw = token.strip()
+        if raw.startswith("<#") and raw.endswith(">"):
+            try:
+                channel_id_inner = int(raw[2:-1])
+            except ValueError:
+                return None
+            return ctx.guild.get_channel(channel_id_inner)
+        if raw.startswith("#"):
+            name_inner = raw[1:]
+            return discord.utils.get(ctx.guild.text_channels, name=name_inner)
+        try:
+            channel_id_inner = int(raw)
+        except ValueError:
+            return None
+        return ctx.guild.get_channel(channel_id_inner)
+
+    notify_channel: discord.TextChannel | None = None
+    monitored_channels: set[int] = set()
+    nonreply_only = False
+
+    while parts:
+        token = parts.pop(0)
+        lowered = token.lower()
+        if lowered == "modlogchannel":
+            if not parts:
+                await ctx.send("Please provide a channel after `modlogchannel`.")
+                return
+            channel_token = parts.pop(0)
+            channel = _resolve_channel(channel_token)
+            if not isinstance(channel, discord.TextChannel):
+                await ctx.send("Please mention a valid text channel after `modlogchannel`.")
+                return
+            notify_channel = channel
+            continue
+        if lowered == "specchannel":
+            if not parts:
+                await ctx.send("Provide at least one channel after `specchannel`.")
+                return
+            spec_found = False
+            while parts and not _is_keyword(parts[0]):
+                channel_token = parts.pop(0)
+                channel = _resolve_channel(channel_token)
+                if not isinstance(channel, discord.TextChannel):
+                    await ctx.send("`specchannel` must be followed by valid text channel mentions.")
+                    return
+                monitored_channels.add(channel.id)
+                spec_found = True
+            if not spec_found:
+                await ctx.send("Provide at least one channel after `specchannel`.")
+                return
+            continue
+        if lowered.startswith("nonreply"):
+            state_token = None
+
+            # Allow inline forms like nonreply=on or nonreply:on
+            inline = lowered[len("nonreply"):].lstrip(" =:")
+            if inline:
+                state_token = inline
+
+            if state_token is None and parts and not _is_keyword(parts[0]):
+                state_token = parts.pop(0).lower()
+
+            if state_token is None:
+                nonreply_only = True
+                continue
+            if state_token in ("on", "true", "yes", "1", "enable", "enabled"):
+                nonreply_only = True
+                continue
+            if state_token in ("off", "false", "no", "0", "disable", "disabled"):
+                nonreply_only = False
+                continue
+            await ctx.send("Use `nonreply on` or `nonreply off` (inline forms like `nonreply=on` also work).")
+            return
+
+        channel = _resolve_channel(token)
+        if isinstance(channel, discord.TextChannel):
+            if notify_channel is None:
+                notify_channel = channel
+            else:
+                monitored_channels.add(channel.id)
+            continue
+
+        await ctx.send(f"Unrecognized token `{token}` in command arguments.")
+        return
+
+    if notify_channel is None:
+        await ctx.send(
+            "Please specify the moderation alert channel using `modlogchannel #channel` (or mention a channel directly)."
+        )
+        return
+
+    monitored_channels = {cid for cid in monitored_channels if ctx.guild.get_channel(cid)}
+
+    guild_id = ctx.guild.id
+    name_key = rulename.strip().lower()
+    label = rulename.strip() or name_key
+
+    guild_rules = spam_rules_by_guild.setdefault(guild_id, {})
+    guild_rules[name_key] = {
+        "label": label,
+        "min_length": max(0, min_length),
+        "similarity_threshold": similarity_threshold,
+        "time_window": max(0, time_window),
+        "message_count": max(0, message_count),
+        "dm_message": dm_message,
+        "notify_channel_id": notify_channel.id,
+        "channels": monitored_channels,
+        "nonreply_only": nonreply_only,
+    }
+
+    save_security_settings()
+
+    details = [
+        f"Spam rule `{label}` saved.",
+        f"- Min characters: {min_length}",
+        f"- Similarity: {similarity_threshold * 100:.0f}%",
+        f"- Window: {duration_display}",
+        f"- Message count: {message_count}",
+        f"- Notify: {notify_channel.mention}",
+    ]
+    if monitored_channels:
+        channel_mentions = ", ".join(f"<#{cid}>" for cid in monitored_channels)
+        details.append(f"- Monitored channels: {channel_mentions}")
+    else:
+        details.append("- Monitored channels: all text channels")
+    details.append(f"- Count only non-replies: {'Yes' if nonreply_only else 'No'}")
+
+    await ctx.send("\n".join(details))
+
+@bot.command(name="removespamrule")
+async def removespamrule(ctx, rulename: str):
+    """Remove a previously configured spam rule"""
+    if not is_security_authorized(ctx):
+        await ctx.message.delete()
+        return
+
+    if ctx.guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if await _handle_security_rate_limit(ctx, "removespamrule"):
+        return
+
+    guild_id = ctx.guild.id
+    guild_rules = spam_rules_by_guild.get(guild_id)
+    if not guild_rules:
+        await ctx.send("No spam rules are configured for this server.")
+        return
+
+    name_key = rulename.strip().lower()
+    if name_key not in guild_rules:
+        await ctx.send("No spam rule found with that name.")
+        return
+
+    removed_rule = guild_rules.pop(name_key, None)
+    if not guild_rules:
+        try:
+            del spam_rules_by_guild[guild_id]
+        except KeyError:
+            pass
+
+    # Clean trigger log entries for this rule in this guild
+    keys_to_delete = [key for key in spam_rule_trigger_log if key[0] == guild_id and key[2] == name_key]
+    for key in keys_to_delete:
+        del spam_rule_trigger_log[key]
+
+    # Save settings after removal
+    save_security_settings()
+
+    await remove_spam_violation_stats_for_rule(guild_id, name_key)
+
+    label = removed_rule.get("label") if removed_rule else rulename
+    await ctx.send(f"Spam rule `{label}` has been removed.")
+
+
+@bot.command(name="spamrules")
+async def spamrules(ctx):
+    """List configured spam rules"""
+    if not is_security_authorized(ctx):
+        await ctx.message.delete()
+        return
+
+    if ctx.guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    guild_rules = spam_rules_by_guild.get(ctx.guild.id)
+    if not guild_rules:
+        await ctx.send("No spam rules are currently configured for this server.")
+        return
+
+    def _format_window(seconds: int) -> str:
+        seconds = max(0, int(seconds))
+        if seconds == 0:
+            return "0s"
+        if seconds % 86400 == 0:
+            return f"{seconds // 86400}d"
+        if seconds % 3600 == 0:
+            return f"{seconds // 3600}h"
+        if seconds % 60 == 0:
+            return f"{seconds // 60}m"
+        return f"{seconds}s"
+
+    lines: list[str] = ["🧩 **Configured Spam Rules**"]
+    for name_key, rule in sorted(guild_rules.items()):
+        label = rule.get("label", name_key)
+        min_length = rule.get("min_length", 0)
+        similarity = float(rule.get("similarity_threshold", 0.0)) * 100
+        message_count = rule.get("message_count", 0)
+        window = _format_window(rule.get("time_window", 0))
+        nonreply_only = _coerce_bool(rule.get("nonreply_only", False))
+
+        notify_channel_id = rule.get("notify_channel_id")
+        notify_channel = None
+        if notify_channel_id:
+            notify_channel = ctx.guild.get_channel(int(notify_channel_id))
+
+        channels = rule.get("channels", set()) or set()
+        if channels:
+            channel_mentions = []
+            for channel_id in sorted(channels):
+                channel_obj = ctx.guild.get_channel(int(channel_id))
+                if isinstance(channel_obj, discord.TextChannel):
+                    channel_mentions.append(channel_obj.mention)
+                else:
+                    channel_mentions.append(f"`{channel_id}`")
+            channels_text = ", ".join(channel_mentions)
+        else:
+            channels_text = "All text channels"
+
+        notify_text = (
+            notify_channel.mention
+            if isinstance(notify_channel, discord.TextChannel)
+            else (f"`{notify_channel_id}`" if notify_channel_id else "Not set")
+        )
+
+        lines.extend([
+            f"\n**{label}** (`{name_key}`)",
+            f"• Min characters: {min_length}",
+            f"• Similarity: {similarity:.0f}%",
+            f"• Threshold: {message_count} messages in {window}",
+            f"• Mod-log channel: {notify_text}",
+            f"• Scope: {channels_text}",
+            f"• Count only non-replies: {'Yes' if nonreply_only else 'No'}",
+        ])
+
+        dm_message = rule.get("dm_message")
+        if dm_message:
+            preview = dm_message if len(dm_message) <= 120 else dm_message[:117] + "..."
+            lines.append(f"• DM message: {preview}")
+
+    messages: list[str] = []
+    buffer: list[str] = []
+    length = 0
+    for line in lines:
+        addition = len(line) + 1
+        if buffer and length + addition > 1900:
+            messages.append("\n".join(buffer))
+            buffer = [line]
+            length = len(line)
+        else:
+            buffer.append(line)
+            length += addition
+
+    if buffer:
+        messages.append("\n".join(buffer))
+
+    for chunk in messages:
+        await ctx.send(chunk)
 
 # on_member_join event (Security Filters)
 @bot.event
@@ -1182,6 +2074,11 @@ async def securitysettings(ctx):
     embed.add_field(name="Authorization Limit", value=f"{len(security_authorized_ids)}/{MAX_SECURITY_AUTHORIZED_USERS}", inline=True)
     embed.add_field(name="Audit Log Entries", value=f"{len(security_audit_log)}/100", inline=True)
     embed.add_field(name="Rate Limiting", value=f"{SECURITY_COMMAND_RATE_LIMIT} commands/{SECURITY_COMMAND_RATE_WINDOW}s", inline=True)
+    guild_spam_rules = spam_rules_by_guild.get(ctx.guild.id, {})
+    if guild_spam_rules:
+        embed.add_field(name="Spam Rules", value=f"{len(guild_spam_rules)} configured", inline=False)
+    else:
+        embed.add_field(name="Spam Rules", value="No spam rules configured", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command(name="securityaudit")
@@ -1251,23 +2148,39 @@ async def securityhelp(ctx):
         "   - Description: Shows active regex rules and their details (channels and exemptions). Provide a name to see only that rule.\n\n"
         "11. **!delregexsettings <regexsettingsname>**\n"
         "   - Description: Deletes the specified regex setting from this server.\n\n"
-        "12. **!setverifyrole <role_id|@role>**\n"
+        "12. **!spamrule <name> characters>... %... <duration> message>... dm <text> ...**\n"
+        "   - Description: Creates or updates a spam rule that detects similar messages within a time window, DMs the user, and alerts moderators.\n"
+        "   - Duration options include: `24h`, `7d`, `30d`, `60d`, `90d`, `120d`, `180d`, `360d`.\n"
+        "   - Optional switches: `modlogchannel #channel` (or channel ID), `specchannel #ch1 #ch2`, `nonreply on|off` (add after the DM text, usually at the end; default: off). Inline forms like `nonreply=on` also work.\n"
+        "   - Tip: Make sure the channel you mention after `modlogchannel` actually exists (or use its numeric ID). Keep `nonreply on|off` as the last switch.\n"
+        "   - Examples:\n"
+        "       • `!spamrule promo characters>40 %85 24h message>4 dm \"Please avoid repeating promotional messages.\" modlogchannel #modhub specchannel #general #announcements`\n"
+        "       • `!spamrule replies characters>25 %80 24h message>3 dm \"Please avoid mass replying to threads.\" modlogchannel 123456789012345678 nonreply on` (replace the numbers with your mod-log channel ID)\n"
+        "       • `!spamrule ads characters>20 %90 7d message>3 dm \"Advertising content is not allowed.\" modlogchannel #compliance specchannel #marketplace`\n"
+        "       • `!spamrule flood characters>15 %75 24h message>5 dm \"Please stop flooding the chat.\" modlogchannel #security-alerts`\n\n"
+        "13. **!removespamrule <name>**\n"
+        "   - Description: Deletes the specified spam rule from this server.\n"
+        "   - Example: `!removespamrule flood`\n\n"
+        "14. **!spamrules**\n"
+        "   - Description: Lists all configured spam rules with their thresholds and options.\n"
+        "   - Example: `!spamrules`\n\n"
+        "15. **!setverifyrole <role_id|@role>**\n"
         "   - Description: Sets the role to be assigned after successful CAPTCHA verification.\n"
         "   - Example: `!setverifyrole @Verified` → Sets the Verified role as the verification reward.\n\n"
-        "13. **!sendverifypanel [#channel|channel_id]**\n"
+        "16. **!sendverifypanel [#channel|channel_id]**\n"
         "   - Description: Sends a verification panel with CAPTCHA button to the specified channel (or current channel).\n"
         "   - Example: `!sendverifypanel #verification` → Sends verification panel to the verification channel.\n\n"
-        "14. **!setverifypaneltext <title|description|image> <text|url>**\n"
+        "17. **!setverifypaneltext <title|description|image> <text|url>**\n"
         "   - Description: Customizes the verification panel title, description text, or image.\n"
         "   - Examples: `!setverifypaneltext title Welcome to Our Server` → Changes panel title.\n"
         "   - `!setverifypaneltext image https://example.com/logo.png` → Adds panel image.\n\n"
-        "15. **!showverifypaneltext**\n"
+        "18. **!showverifypaneltext**\n"
         "   - Description: Shows the current verification panel text settings.\n\n"
-        "16. **!resetverifypaneltext**\n"
+        "19. **!resetverifypaneltext**\n"
         "   - Description: Resets verification panel text to default values.\n\n"
-        "17. **!savesecurity**\n"
+        "20. **!savesecurity**\n"
         "   - Description: Manually saves all security settings to file.\n\n"
-        "18. **!securityhelp**\n"
+        "21. **!securityhelp**\n"
         "   - Description: Shows this help menu.\n"
     )
     # Split into chunks to respect Discord 2000-char message limit
@@ -1760,6 +2673,9 @@ async def on_ready():
     # Load security settings from file
     print("[SECURITY] Loading security settings...")
     load_security_settings()
+
+    print("[SECURITY] Loading spam violation statistics...")
+    load_spam_violation_stats()
     
     # Register persistent view so button keeps working after restart
     try:
