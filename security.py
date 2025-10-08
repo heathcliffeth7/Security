@@ -8,7 +8,7 @@ import random
 import string
 import io
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, Counter
 import shlex
 from difflib import SequenceMatcher
 import time
@@ -735,7 +735,33 @@ def _reset_spam_history_for_rule(guild_id: int, rule_key: str) -> None:
         if key[0] == guild_id and key[2] == rule_key
     ]
     for trigger_key in trigger_keys:
-        spam_rule_trigger_log.pop(trigger_key, None)
+            spam_rule_trigger_log.pop(trigger_key, None)
+
+
+_WORD_TOKEN_PATTERN = re.compile(r"\w+")
+
+
+def _extract_word_tokens(text: str) -> list[str]:
+    """Return lowercase word tokens extracted from text."""
+
+    if not text:
+        return []
+    return [token for token in _WORD_TOKEN_PATTERN.findall(text.lower()) if token]
+
+
+def _token_multiset_similarity(tokens1: list[str], tokens2: list[str]) -> float:
+    """Compute multiset Jaccard similarity between two token lists."""
+
+    if not tokens1 or not tokens2:
+        return 0.0
+
+    counts1 = Counter(tokens1)
+    counts2 = Counter(tokens2)
+    intersection = sum(min(counts1[token], counts2[token]) for token in counts1.keys())
+    union = sum(max(counts1.get(token, 0), counts2.get(token, 0)) for token in set(counts1) | set(counts2))
+    if union == 0:
+        return 0.0
+    return intersection / union
 
 
 def _parse_pattern_and_flags(raw_text):
@@ -984,6 +1010,8 @@ async def _check_message_against_spam_rules(message: discord.Message):
     if not content:
         return
 
+    content_tokens = _extract_word_tokens(content)
+
     now = time.time()
     history_key = (message.guild.id, message.author.id)
     user_history = spam_message_history[history_key]
@@ -1006,6 +1034,7 @@ async def _check_message_against_spam_rules(message: discord.Message):
         "content": content,
         "is_reply": is_reply,
         "channel_id": message.channel.id,
+        "tokens": content_tokens,
     })
 
     for name_key, rule in guild_rules.items():
@@ -1055,7 +1084,16 @@ async def _check_message_against_spam_rules(message: discord.Message):
 
         similar_count = 0
         for entry in relevant_messages:
-            ratio = SequenceMatcher(None, content, entry["content"]).ratio()
+            entry_content = entry.get("content", "")
+            char_ratio = SequenceMatcher(None, content, entry_content).ratio() if entry_content else 0.0
+
+            entry_tokens = entry.get("tokens")
+            if entry_tokens is None:
+                entry_tokens = _extract_word_tokens(entry_content)
+                entry["tokens"] = entry_tokens
+
+            token_ratio = _token_multiset_similarity(content_tokens, entry_tokens)
+            ratio = max(char_ratio, token_ratio)
             if ratio >= similarity_threshold:
                 similar_count += 1
         if similar_count >= message_count:
