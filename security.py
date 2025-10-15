@@ -923,13 +923,20 @@ async def _check_message_against_regex(message: discord.Message):
         return
 
     channel_id = message.channel.id
+    # For threads (forum posts), also check parent channel ID
+    parent_id = None
+    if isinstance(message.channel, discord.Thread):
+        parent_id = message.channel.parent_id
+    
     for rule in guild_rules.values():
         channels = rule.get("channels", set())
         compiled = rule.get("compiled")
         if not compiled or not channels:
             continue
+        # Check if message is in a monitored channel or thread within a monitored channel
         if channel_id not in channels:
-            continue
+            if parent_id is None or parent_id not in channels:
+                continue
 
         if not any(_safe_regex_search(compiled, text) for text in text_blocks):
             continue
@@ -1413,8 +1420,12 @@ async def set_regex_settings(ctx, regexsettingsname: str, *, channels: str):
         return cid_local
 
     if "allchannel" in lower_tokens:
-        # Start with all text channels
+        # Start with all text channels, forum channels, and voice channels (with text chat)
         for ch in ctx.guild.text_channels:
+            selected.add(ch.id)
+        for ch in ctx.guild.forums:
+            selected.add(ch.id)
+        for ch in ctx.guild.voice_channels:
             selected.add(ch.id)
 
         if "notchannel" in lower_tokens:
