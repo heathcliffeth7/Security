@@ -50,6 +50,10 @@ else:
 # Intent settings
 intents = discord.Intents.default()
 intents.members = True  # Required for member join events
+try:
+    intents.messages = True  # ensure message create events
+except Exception:
+    pass
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -74,6 +78,9 @@ def _parse_role_ids(env_value: str | None) -> Set[int]:
         except ValueError:
             print(f"⚠️  WARNING: Invalid SECURITY_MANAGER_ROLE_ID entry ignored: {token!r}")
     return ids
+
+# Whitelist for security filters (users on whitelist bypass noavatar and account age filters)
+security_whitelist_users: Set[int] = set()
 
 
 def _chunk_message_lines(lines: list[str], limit: int = 1900):
@@ -285,6 +292,9 @@ def save_security_settings():
             # Security Authorization
             "security_authorized_ids": list(security_authorized_ids),
             
+            # Whitelist
+            "security_whitelist_users": list(security_whitelist_users),
+            
             # CAPTCHA Settings
             "captcha_verify_role_id": captcha_verify_role_id,
             "captcha_panel_texts": serializable_panel_texts,
@@ -323,7 +333,7 @@ def load_security_settings():
     """Load security settings from JSON file"""
     global no_avatar_filter_enabled, no_avatar_action, no_avatar_timeout_duration
     global account_age_filter_enabled, account_age_min_days, account_age_action, account_age_timeout_duration
-    global security_authorized_ids, captcha_verify_role_id, captcha_panel_texts
+    global security_authorized_ids, security_whitelist_users, captcha_verify_role_id, captcha_panel_texts
     global regex_settings_by_guild, verify_button_usage, spam_rules_by_guild
     
     try:
@@ -350,6 +360,9 @@ def load_security_settings():
         
         # Security Authorization
         security_authorized_ids = set(settings_data.get("security_authorized_ids", []))
+        
+        # Whitelist
+        security_whitelist_users = set(settings_data.get("security_whitelist_users", []))
         
         # CAPTCHA Settings
         captcha_verify_role_id = settings_data.get("captcha_verify_role_id", None)
@@ -870,6 +883,24 @@ def _collect_regex_text_blocks(
     if content:
         blocks.append(content)
 
+    # Also include system-rendered text (forwarded/announcement/system messages)
+    system_content = getattr(message, "system_content", None)
+    if isinstance(system_content, str) and system_content.strip():
+        if system_content != content:
+            blocks.append(system_content)
+
+    # Include attachment URLs
+    try:
+        for att in getattr(message, "attachments", []) or []:
+            url = getattr(att, "url", None)
+            if url:
+                blocks.append(str(url))
+            proxy_url = getattr(att, "proxy_url", None)
+            if proxy_url and proxy_url != url:
+                blocks.append(str(proxy_url))
+    except Exception:
+        pass
+
     for embed in getattr(message, "embeds", []) or []:
         title = getattr(embed, "title", None)
         if title:
@@ -877,6 +908,28 @@ def _collect_regex_text_blocks(
         description = getattr(embed, "description", None)
         if description:
             blocks.append(description)
+        # Also include URLs present on the embed and its media
+        try:
+            e_url = getattr(embed, "url", None)
+            if e_url:
+                blocks.append(str(e_url))
+            thumb = getattr(embed, "thumbnail", None)
+            if thumb is not None:
+                turl = getattr(thumb, "url", None)
+                if turl:
+                    blocks.append(str(turl))
+            image = getattr(embed, "image", None)
+            if image is not None:
+                iurl = getattr(image, "url", None)
+                if iurl:
+                    blocks.append(str(iurl))
+            video = getattr(embed, "video", None)
+            if video is not None:
+                vurl = getattr(video, "url", None)
+                if vurl:
+                    blocks.append(str(vurl))
+        except Exception:
+            pass
         for field in getattr(embed, "fields", []) or []:
             field_name = getattr(field, "name", None)
             field_value = getattr(field, "value", None)
@@ -903,20 +956,89 @@ def _collect_regex_text_blocks(
         if target is not None:
             blocks.extend(_collect_regex_text_blocks(target, _seen=seen))
 
+    # Forwarded message snapshots (Discord API v2.5+)
+    try:
+        snapshots = getattr(message, "message_snapshots", None)
+        if snapshots:
+            for snap in snapshots or []:
+                s_content = getattr(snap, "content", None)
+                if s_content:
+                    blocks.append(s_content)
+                # Include snapshot embeds and their URLs
+                for emb in getattr(snap, "embeds", []) or []:
+                    t = getattr(emb, "title", None)
+                    d = getattr(emb, "description", None)
+                    if t:
+                        blocks.append(t)
+                    if d:
+                        blocks.append(d)
+                    try:
+                        eurl = getattr(emb, "url", None)
+                        if eurl:
+                            blocks.append(str(eurl))
+                        th = getattr(emb, "thumbnail", None)
+                        if th is not None:
+                            tu = getattr(th, "url", None)
+                            if tu:
+                                blocks.append(str(tu))
+                        im = getattr(emb, "image", None)
+                        if im is not None:
+                            iu = getattr(im, "url", None)
+                            if iu:
+                                blocks.append(str(iu))
+                        vd = getattr(emb, "video", None)
+                        if vd is not None:
+                            vu = getattr(vd, "url", None)
+                            if vu:
+                                blocks.append(str(vu))
+                    except Exception:
+                        pass
+                # Include snapshot attachment URLs
+                for att in getattr(snap, "attachments", []) or []:
+                    au = getattr(att, "url", None)
+                    if au:
+                        blocks.append(str(au))
+    except Exception:
+        pass
+
     return [block for block in blocks if isinstance(block, str) and block.strip()]
 
 
 # Helper function for regex moderation (shared by on_message and on_message_edit)
 async def _check_message_against_regex(message: discord.Message):
     """Check message against regex rules and delete if it matches"""
-    if message.author.bot:
-        return
     if message.guild is None:
         return
 
+    # Apply target channel rules regardless of the source/origin.
+    # Only skip our own bot's messages to prevent loops; check everything else (including webhooks/other bots).
+    try:
+        if bot.user and message.author and message.author.id == bot.user.id:
+            return
+    except Exception:
+        pass
+
     text_blocks = _collect_regex_text_blocks(message)
+    if DEBUG_MODE:
+        try:
+            snaps = getattr(message, 'message_snapshots', None)
+            print(
+                f"[REGEX_SCAN] blocks={len(text_blocks)} content_len={len(message.content or '')} "
+                f"embeds={len(getattr(message,'embeds',[]) or [])} atts={len(getattr(message,'attachments',[]) or [])} "
+                f"snapshots={len(snaps) if snaps is not None else 0}",
+                flush=True,
+            )
+        except Exception:
+            pass
     if not text_blocks:
         return
+
+    # Debug logging for message scanning
+    if DEBUG_MODE:
+        try:
+            print(f"[DEBUG] Scanning message in channel {message.channel.id} ({getattr(message.channel, 'name', '?')}) | author_bot={getattr(message.author, 'bot', None)} webhook_id={getattr(message, 'webhook_id', None)} flags={getattr(getattr(message,'flags',None),'value', None)}")
+        except Exception:
+            pass
 
     guild_rules = regex_settings_by_guild.get(message.guild.id)
     if not guild_rules:
@@ -934,8 +1056,14 @@ async def _check_message_against_regex(message: discord.Message):
         if not compiled or not channels:
             continue
         # Check if message is in a monitored channel or thread within a monitored channel
+        # For forwarded/webhook messages, always check the destination channel rules
         if channel_id not in channels:
             if parent_id is None or parent_id not in channels:
+                if DEBUG_MODE:
+                    try:
+                        print(f"[DEBUG] Message not in monitored channels. Channel: {channel_id}, Parent: {parent_id}, Monitored count: {len(channels)}", flush=True)
+                    except Exception:
+                        pass
                 continue
 
         if not any(_safe_regex_search(compiled, text) for text in text_blocks):
@@ -1207,6 +1335,47 @@ async def _handle_spam_rule_trigger(message: discord.Message, rule_key: str, rul
 # Message moderation via regex
 @bot.event
 async def on_message(message: discord.Message):
+    # Debug logs (only when DEBUG_MODE is enabled)
+    if DEBUG_MODE:
+        try:
+            flags = getattr(message, "flags", None)
+            is_cross = bool(getattr(flags, "is_crossposted", False) or getattr(flags, "crossposted", False)) if flags else False
+            is_webhook = getattr(message, "webhook_id", None) is not None
+            is_bot_author = bool(getattr(getattr(message, "author", None), "bot", False))
+            own_bot = False
+            try:
+                own_bot = bool(bot.user and message.author and message.author.id == bot.user.id)
+            except Exception:
+                own_bot = False
+            if is_cross or is_webhook:
+                ch_name = getattr(message.channel, "name", "?")
+                print(f"[FORWARD_LOG] guild={getattr(getattr(message,'guild',None),'id',None)} ch={message.channel.id}/{ch_name} webhook={is_webhook} cross={is_cross} len={len(message.content or '')} sys={bool(getattr(message,'system_content', None))}", flush=True)
+            # Log for any bot/webhook-authored message in case forwards are not flagged
+            if (is_bot_author and not own_bot) or is_webhook:
+                ch_name = getattr(message.channel, "name", "?")
+                print(
+                    f"[BOT_OR_WEBHOOK_LOG] guild={getattr(getattr(message,'guild',None),'id',None)} ch={message.channel.id}/{ch_name} "
+                    f"author_bot={is_bot_author} own_bot={own_bot} webhook={is_webhook} type={getattr(message,'type', None)}",
+                    flush=True)
+            # Also log whenever a message arrives in any channel monitored by regex rules
+            if message.guild is not None:
+                guild_rules = regex_settings_by_guild.get(message.guild.id) or {}
+                monitored: set[int] = set()
+                for r in guild_rules.values():
+                    chs = r.get("channels", set()) or set()
+                    monitored |= set(chs)
+                parent_id = message.channel.parent_id if isinstance(message.channel, discord.Thread) else None
+                in_monitored = (message.channel.id in monitored) or (parent_id in monitored if parent_id else False)
+                if in_monitored:
+                    ch_name = getattr(message.channel, "name", "?")
+                    print(
+                        f"[MONITOR_LOG] ch={message.channel.id}/{ch_name} parent={parent_id} in_monitored={in_monitored} "
+                        f"type={getattr(message,'type', None)} bot_author={getattr(getattr(message,'author',None),'bot', None)} "
+                        f"webhook={is_webhook} sys={bool(getattr(message,'system_content', None))} len={len(message.content or '')}",
+                        flush=True)
+        except Exception:
+            pass
+
     # Let command processor run only in guilds
     if message.guild and isinstance(bot.command_prefix, str) and message.content.startswith(bot.command_prefix):
         await bot.process_commands(message)
@@ -2044,6 +2213,11 @@ async def spamrules(ctx):
 # on_member_join event (Security Filters)
 @bot.event
 async def on_member_join(member):
+    # Check if user is whitelisted - whitelisted users bypass all security filters
+    if member.id in security_whitelist_users:
+        print(f"[SECURITY] User {member.id} is whitelisted, bypassing security filters")
+        return
+    
     if no_avatar_filter_enabled:
         if member.avatar is None:
             try:
@@ -2151,6 +2325,126 @@ async def accountagefilter_command(ctx, state: str, min_age: int = None, mode: s
         save_security_settings()
     else:
         await ctx.send("Please type 'on' or 'off'.")
+
+# !addwhitelistuser command
+@bot.command(name="addwhitelistuser")
+async def addwhitelistuser_command(ctx, user_id: str):
+    """Add a user to the whitelist (bypasses noavatar and account age filters)"""
+    if not is_security_authorized(ctx):
+        await ctx.message.delete()
+        return
+    
+    # Security: Rate limiting
+    if await _handle_security_rate_limit(ctx, "addwhitelistuser"):
+        return
+    
+    # Parse user ID
+    try:
+        # Strip mention formatting if present
+        clean_id = user_id.strip("<@!>")
+        uid = int(clean_id)
+    except ValueError:
+        await ctx.send("❌ Please provide a valid user ID or mention. Example: `!addwhitelistuser @user` or `!addwhitelistuser 123456789`")
+        return
+    
+    # Check if already whitelisted
+    if uid in security_whitelist_users:
+        await ctx.send("⚠️ This user is already in the whitelist.")
+        return
+    
+    # Add to whitelist
+    security_whitelist_users.add(uid)
+    
+    # Save settings
+    save_security_settings()
+    
+    # Get user info for confirmation
+    try:
+        user = await bot.fetch_user(uid)
+        user_display = f"{user.name} ({user.id})"
+    except:
+        user_display = f"User ID: {uid}"
+    
+    await ctx.send(f"✅ User **{user_display}** has been added to the whitelist.\n"
+                   f"📊 This user will bypass noavatar and account age filters.\n"
+                   f"Total whitelisted users: {len(security_whitelist_users)}")
+    print(f"[SECURITY] User {uid} added to whitelist by {ctx.author.name} ({ctx.author.id})")
+
+# !removewhitelistuser command
+@bot.command(name="removewhitelistuser")
+async def removewhitelistuser_command(ctx, user_id: str):
+    """Remove a user from the whitelist"""
+    if not is_security_authorized(ctx):
+        await ctx.message.delete()
+        return
+    
+    # Security: Rate limiting
+    if await _handle_security_rate_limit(ctx, "removewhitelistuser"):
+        return
+    
+    # Parse user ID
+    try:
+        # Strip mention formatting if present
+        clean_id = user_id.strip("<@!>")
+        uid = int(clean_id)
+    except ValueError:
+        await ctx.send("❌ Please provide a valid user ID or mention. Example: `!removewhitelistuser @user` or `!removewhitelistuser 123456789`")
+        return
+    
+    # Check if in whitelist
+    if uid not in security_whitelist_users:
+        await ctx.send("⚠️ This user is not in the whitelist.")
+        return
+    
+    # Remove from whitelist
+    security_whitelist_users.remove(uid)
+    
+    # Save settings
+    save_security_settings()
+    
+    # Get user info for confirmation
+    try:
+        user = await bot.fetch_user(uid)
+        user_display = f"{user.name} ({user.id})"
+    except:
+        user_display = f"User ID: {uid}"
+    
+    await ctx.send(f"✅ User **{user_display}** has been removed from the whitelist.\n"
+                   f"📊 This user will now be subject to security filters.\n"
+                   f"Total whitelisted users: {len(security_whitelist_users)}")
+    print(f"[SECURITY] User {uid} removed from whitelist by {ctx.author.name} ({ctx.author.id})")
+
+# !whitelistusers command
+@bot.command(name="whitelistusers")
+async def whitelistusers_command(ctx):
+    """List all whitelisted users"""
+    if not is_security_authorized(ctx):
+        await ctx.message.delete()
+        return
+    
+    if not security_whitelist_users:
+        await ctx.send("📋 **Whitelist is empty**\nNo users are currently whitelisted.")
+        return
+    
+    lines = [
+        "📋 **Whitelisted Users**",
+        f"Total: {len(security_whitelist_users)}",
+        "",
+        "These users bypass noavatar and account age filters:",
+        ""
+    ]
+    
+    # Fetch user info for each whitelisted user (no mentions)
+    for uid in sorted(security_whitelist_users):
+        try:
+            user = await bot.fetch_user(uid)
+            username = getattr(user, "global_name", None) or getattr(user, "name", str(uid))
+            user_info = f"• {username} (ID: {uid})"
+        except Exception:
+            user_info = f"• Unknown User (ID: {uid})"
+        lines.append(user_info)
+    
+    await _send_long_message(ctx.send, "\n".join(lines))
 
 # ---------------- Security Commands ----------------
 @bot.command(name="securityauthorizedadd")
@@ -2329,11 +2623,18 @@ async def securitysettings(ctx):
         if account_age_action == "timeout":
             lines.append(f"Account Age Timeout: {account_age_timeout_duration} minutes")
 
+    # Whitelist info
+    whitelist_str = ", ".join(str(i) for i in security_whitelist_users) if security_whitelist_users else "No users whitelisted"
+    
     lines.extend(
         [
             "",
             f"Security Authorized IDs: {ids_str}",
             f"Authorization Limit: {len(security_authorized_ids)}/{MAX_SECURITY_AUTHORIZED_USERS}",
+            "",
+            f"Whitelisted Users: {len(security_whitelist_users)}",
+            f"Whitelist IDs: {whitelist_str}",
+            "",
             f"Audit Log Entries: {len(security_audit_log)}/100",
             f"Rate Limiting: {SECURITY_COMMAND_RATE_LIMIT} commands/{SECURITY_COMMAND_RATE_WINDOW}s",
         ]
@@ -2444,9 +2745,17 @@ async def securityhelp(ctx):
         "   - Description: Shows the current verification panel text settings.\n\n"
         "19. **!resetverifypaneltext**\n"
         "   - Description: Resets verification panel text to default values.\n\n"
-        "20. **!savesecurity**\n"
+        "20. **!addwhitelistuser <user_id|@user>**\n"
+        "   - Description: Adds a user to the whitelist. Whitelisted users bypass noavatar and account age filters.\n"
+        "   - Example: `!addwhitelistuser @john` → Adds john to the whitelist.\n\n"
+        "21. **!removewhitelistuser <user_id|@user>**\n"
+        "   - Description: Removes a user from the whitelist.\n"
+        "   - Example: `!removewhitelistuser 123456789` → Removes user from whitelist.\n\n"
+        "22. **!whitelistusers**\n"
+        "   - Description: Lists all whitelisted users with their names and IDs.\n\n"
+        "23. **!savesecurity**\n"
         "   - Description: Manually saves all security settings to file.\n\n"
-        "21. **!securityhelp**\n"
+        "24. **!securityhelp**\n"
         "   - Description: Shows this help menu.\n"
     )
     # Split into chunks to respect Discord 2000-char message limit
